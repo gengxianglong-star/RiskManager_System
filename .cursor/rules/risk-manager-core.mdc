@@ -1,0 +1,12 @@
+---
+description: 极致动量风控军师系统 — 核心约定
+alwaysApply: true
+---
+
+# RiskManager_System — 核心约定
+
+- 本项目与 IBKR Order Tool 完全独立，勿混入 PyQt 下单工具代码。
+- IB 调用走 asyncio（ib_insync + util.patchAsyncio）；Telegram 回调勿阻塞主事件循环。
+- 密钥写在 main.py 配置区或环境变量，不提交 .env / risk_manager.db。
+- 改业务逻辑后至少验证：`python3 -m py_compile main.py`。
+- 提交信息用中文完整句，说明「为什么」。
