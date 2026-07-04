@@ -18,7 +18,7 @@ except RuntimeError:
 
 import aiosqlite
 import pandas_market_calendars as mcal
-from ib_insync import IB, FlexReport, Stock
+from ib_insync import IB, FlexReport, Stock, util
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
@@ -29,6 +29,8 @@ from config import (
     FLEX_TOKEN,
     MAX_POSITION_SIZE_PCT,
     MAX_STOP_PCT,
+    MAX_DAILY_TRADES,
+    MAX_OVERNIGHT_RISK_PCT,
     MY_TELEGRAM_CHAT_ID,
     RISK_MAX_DRAWDOWN_GREEN,
     RISK_MAX_DRAWDOWN_YELLOW,
@@ -44,7 +46,9 @@ from database import (
     load_pending_intent,
     save_pending_intent,
     upsert_account_state,
+    get_today_trade_count,
 )
+from market_regime import fetch_market_regime
 from notion_api import push_to_notion
 
 ib = IB()
@@ -107,26 +111,6 @@ async def fetch_account_equity() -> float:
     except Exception as e:
         print(f"净值读取失败: {e}")
     return 0.0
-
-
-def fetch_spy_context_sync() -> str:
-    try:
-        from finvizfinance.quote import finvizfinance
-
-        spy = finvizfinance("SPY")
-        fund = spy.ticker_fundament()
-        if fund is not None and not fund.empty:
-            change = fund.loc["Change", "SPY"] if "Change" in fund.index else None
-            if change is not None:
-                return f"SPY {change}"
-    except Exception as e:
-        print(f"Finviz SPY 语境失败: {e}")
-    return "SPY N/A"
-
-
-async def fetch_spy_context() -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, fetch_spy_context_sync)
 
 
 async def calculate_risk_light(db_connection, current_total_equity: float):
@@ -409,34 +393,93 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
         equity = await fetch_account_equity()
         async with aiosqlite.connect(DB_PATH) as conn:
             conn.row_factory = aiosqlite.Row
-            risk_light, risk_budget = await calculate_risk_light(conn, equity)
+
+            today_count = await get_today_trade_count(conn)
+            if today_count >= MAX_DAILY_TRADES:
+                await update.message.reply_text(
+                    f"🛑 **狙击手协议触发！**\n"
+                    f"今日弹夹已打空 (已开仓 {today_count}/{MAX_DAILY_TRADES} 次)。\n"
+                    f"在这个胜率下绝对不允许继续试错。请关掉软件，明日再战！"
+                )
+                return
+
+            risk_light, base_risk_budget = await calculate_risk_light(conn, equity)
             await upsert_account_state(conn, equity, risk_light)
-            if risk_budget <= 0:
+            if base_risk_budget <= 0:
                 await update.message.reply_text(f"🚨 风控灯 {risk_light}，当前禁止新开仓。")
                 return
 
-            quantity = calc_share_quantity(risk_budget, entry_price, stop_price)
-            if quantity <= 0:
-                await update.message.reply_text("🚨 计算股数为 0，请检查止损距离或账户净值。")
+            regime_tag, insight, risk_mult = await fetch_market_regime()
+            if risk_mult == 0.0:
+                await update.message.reply_text(
+                    f"🛑 **宏观环境一票否决！**\n"
+                    f"当前状态: {regime_tag}\n"
+                    f"终端洞察: {insight}\n"
+                    f"军师判定：覆巢之下无完卵。在 Bear Thrust 下，系统拒绝一切多头建仓。"
+                )
                 return
 
-            spy_context = await fetch_spy_context()
+            dynamic_risk_budget = base_risk_budget * risk_mult
+
+            cursor = await conn.execute(
+                "SELECT entry_price, current_stop, quantity FROM shadow_ledger WHERE status='OPEN'"
+            )
+            open_positions = await cursor.fetchall()
+
+            current_total_risk = 0.0
+            for pos in open_positions:
+                pos_entry = float(pos["entry_price"])
+                pos_stop = float(pos["current_stop"])
+                pos_qty = float(pos["quantity"])
+                trade_risk = max(0.0, (pos_entry - pos_stop) * pos_qty)
+                current_total_risk += trade_risk
+
+            quantity = calc_share_quantity(dynamic_risk_budget, entry_price, stop_price)
+            if quantity <= 0:
+                await update.message.reply_text("🚨 动态折算后计算股数为 0，请检查止损距离。")
+                return
+
+            new_trade_risk = abs(entry_price - stop_price) * quantity
+            projected_total_risk = current_total_risk + new_trade_risk
+            max_allowed_risk = equity * MAX_OVERNIGHT_RISK_PCT
+
+            if projected_total_risk > max_allowed_risk:
+                pct_str = (
+                    f"{(projected_total_risk / equity) * 100:.2f}%"
+                    if equity > 0
+                    else "N/A"
+                )
+                await update.message.reply_text(
+                    f"🛑 **隔夜风险总闸触发！**\n"
+                    f"当前总持仓风险: ${current_total_risk:.2f}\n"
+                    f"这笔新单风险: ${new_trade_risk:.2f}\n"
+                    f"合并后风险将达到 ${projected_total_risk:.2f} ({pct_str})，"
+                    f"超过系统允许极限 {MAX_OVERNIGHT_RISK_PCT * 100:.2f}%！\n\n"
+                    f"👉 **解法：** 请通过 `/update` 将现有盈利单止损推至成本价，释放额度后再试。"
+                )
+                return
+
+            regime_context = f"{regime_tag} | {insight}"
             intent_id = uuid.uuid4().hex[:8]
             await save_pending_intent(
                 conn, intent_id, symbol, stop_price, setup_tag,
-                entry_price, quantity, spy_context,
+                entry_price, quantity, regime_context,
             )
 
         notional = entry_price * quantity
         risk_dollar = abs(entry_price - stop_price) * quantity
         msg = (
-            f"🛡️ 【{symbol} 审查】\n"
+            f"🛡️ 【{symbol} 建仓审查】\n"
             f"入场参考 ({price_src}): ${entry_price:.2f}\n"
             f"止损: ${stop_price:.2f} ({risk_pct * 100:.2f}%)\n"
-            f"建议股数: {quantity} 股 (风险 ${risk_dollar:.2f})\n"
+            f"建议股数: {quantity} 股 (承担风险 ${risk_dollar:.2f})\n"
             f"名义金额: ${notional:,.2f}\n"
-            f"策略: {setup_tag} | {spy_context}\n"
-            f"风控灯: {risk_light}\n\n"
+            f"策略: {setup_tag}\n"
+            f"风控灯: {risk_light}\n"
+            f"🎯 今日剩余子弹: {MAX_DAILY_TRADES - today_count - 1} 发\n\n"
+            f"📊 宏观环境雷达:\n"
+            f"状态: {regime_tag} (仓位乘数 {risk_mult}x)\n"
+            f"洞察: {insight}\n\n"
             f"确认合规？"
         )
         keyboard = [
@@ -776,6 +819,118 @@ async def heartbeat_2300(tg_application):
                 )
 
 
+async def get_10ema(symbol: str) -> float:
+    """利用 IBKR 原生历史数据计算昨日 10EMA。"""
+    try:
+        if not await ensure_ib_connected():
+            return 0.0
+        contract = Stock(symbol.upper(), "SMART", "USD")
+        qualified = await ib.qualifyContractsAsync(contract)
+        if not qualified:
+            return 0.0
+
+        bars = await ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr="15 D",
+            barSizeSetting="1 day",
+            whatToShow="TRADES",
+            useRTH=True,
+        )
+        if not bars:
+            return 0.0
+
+        df = util.df(bars)
+        df["10EMA"] = df["close"].ewm(span=10, adjust=False).mean()
+        return float(df["10EMA"].iloc[-1])
+    except Exception as e:
+        print(f"获取 {symbol} 10EMA 失败: {e}")
+        return 0.0
+
+
+async def active_position_monitor(tg_application):
+    """【3R 腾挪与 10EMA 追踪引擎】后台每 5 分钟巡检一次。"""
+    await asyncio.sleep(15)
+    notified_3r: set[str] = set()
+    notified_ema: set[str] = set()
+
+    print("✅ 动态仓位巡检器 (Scale-out Financer) 已在后台启动...")
+
+    while True:
+        try:
+            if not ib.isConnected():
+                await asyncio.sleep(60)
+                continue
+
+            async with aiosqlite.connect(DB_PATH) as conn:
+                conn.row_factory = aiosqlite.Row
+                cursor = await conn.execute(
+                    "SELECT id, symbol, quantity, entry_price, initial_stop, current_stop "
+                    "FROM shadow_ledger WHERE status='OPEN'"
+                )
+                positions = await cursor.fetchall()
+
+            for pos in positions:
+                trade_id = pos["id"]
+                symbol = pos["symbol"]
+                entry = float(pos["entry_price"])
+                initial_stop = float(pos["initial_stop"])
+                current_stop = float(pos["current_stop"])
+
+                one_r_risk = entry - initial_stop
+                if one_r_risk <= 0:
+                    continue
+
+                current_price, _ = await fetch_entry_price(symbol)
+                if not current_price or current_price <= 0:
+                    continue
+
+                current_profit = current_price - entry
+                current_r_multiple = current_profit / one_r_risk
+
+                # 规则 1：3R 强制减仓与平推止损提醒
+                if current_r_multiple >= 3.0 and current_stop < entry:
+                    cache_key = f"{trade_id}_3R"
+                    if cache_key not in notified_3r:
+                        alert_msg = (
+                            f"🚀 **【3R 爆发确认：严禁全仓死扛！】** `{symbol}`\n\n"
+                            f"当前价格: ${current_price:.2f}\n"
+                            f"当前浮盈: **+{current_r_multiple:.1f} R**\n\n"
+                            f"⚠️ **纪律指令 (两步走)：**\n"
+                            f"1. 请立刻在 TWS **市价卖出 1/4 或 1/3**，用市场的钱为自己买下免费门票！\n"
+                            f"2. 卖出确认后，请立刻点击下方指令，将剩余仓位止损上移至成本价！\n\n"
+                            f"👉 `/update {symbol} {entry:.2f}`\n\n"
+                            f"*(注：只有平推止损后，该股票占用的风控额度才会被系统释放！让剩下的仓位去冲击 10R！)*"
+                        )
+                        await tg_application.bot.send_message(
+                            chat_id=MY_TELEGRAM_CHAT_ID, text=alert_msg
+                        )
+                        notified_3r.add(cache_key)
+
+                elif current_stop >= entry:
+                    ema_10 = await get_10ema(symbol)
+                    if ema_10 > 0 and current_price < (ema_10 * 0.99):
+                        cache_key = f"{trade_id}_10EMA"
+                        if cache_key not in notified_ema:
+                            alert_msg = (
+                                f"🛑 **【尾仓趋势终结】** `{symbol}`\n\n"
+                                f"当前价格: ${current_price:.2f}\n"
+                                f"昨日 10EMA: ${ema_10:.2f}\n\n"
+                                f"⚠️ **纪律指令：**\n"
+                                f"价格已有效跌破 10EMA，动量已衰竭！\n"
+                                f"请立即手动清仓所有剩余的“免费彩票”，锁定波段利润！"
+                            )
+                            await tg_application.bot.send_message(
+                                chat_id=MY_TELEGRAM_CHAT_ID, text=alert_msg
+                            )
+                            notified_ema.add(cache_key)
+
+        except Exception as e:
+            print(f"后台巡检出错: {e}")
+
+        await asyncio.sleep(300)
+
+
 async def ib_keepalive():
     while True:
         if not ib.isConnected():
@@ -799,6 +954,7 @@ async def _post_init(app: Application) -> None:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
     asyncio.create_task(heartbeat_2300(app))
     asyncio.create_task(ib_keepalive())
+    asyncio.create_task(active_position_monitor(app))
     print("✅ Telegram Bot 已启动。")
 
 

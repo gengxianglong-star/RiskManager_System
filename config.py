@@ -21,3 +21,9 @@ RISK_MAX_DRAWDOWN_YELLOW = float(os.getenv("RISK_MAX_DRAWDOWN_YELLOW", "0.10"))
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "0.003"))
 MAX_POSITION_SIZE_PCT = float(os.getenv("MAX_POSITION_SIZE_PCT", "0.40"))
 MAX_STOP_PCT = float(os.getenv("MAX_STOP_PCT", "0.03"))
+
+# 狙击手协议：每日最大开仓次数
+MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))
+
+# 总隔夜风险上限 (占净值比例，推荐 0.015 即 1.5%)
+MAX_OVERNIGHT_RISK_PCT = float(os.getenv("MAX_OVERNIGHT_RISK_PCT", "0.015"))

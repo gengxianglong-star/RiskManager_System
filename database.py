@@ -118,3 +118,12 @@ async def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price,
     )
     await conn.commit()
     return int(cur.lastrowid)
+
+
+async def get_today_trade_count(conn) -> int:
+    """获取今日已确认建仓的次数 (狙击手协议)"""
+    cur = await conn.execute(
+        "SELECT COUNT(*) FROM shadow_ledger WHERE date(create_time, 'localtime') = date('now', 'localtime')"
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
