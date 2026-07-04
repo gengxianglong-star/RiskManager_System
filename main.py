@@ -1,6 +1,5 @@
 import asyncio
 import datetime
-import sqlite3
 import sys
 import uuid
 from zoneinfo import ZoneInfo
@@ -17,103 +16,40 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
+import aiosqlite
 import pandas_market_calendars as mcal
-from ib_insync import IB, FlexReport, Stock, util
-from notion_client import Client
+from ib_insync import IB, FlexReport, Stock
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
-# ==========================================
-# 🛑 配置区 (后续转移到电脑后填入真实密钥)
-# ==========================================
-MY_TELEGRAM_CHAT_ID = 123456789
-TG_BOT_TOKEN = "YOUR_TG_TOKEN"
-TWS_HOST = "127.0.0.1"
-TWS_PORT = 7497
-CLIENT_ID = 2
-FLEX_TOKEN = "YOUR_FLEX_TOKEN"
-FLEX_QUERY_ID = "YOUR_FLEX_QUERY_ID"
-NOTION_TOKEN = "YOUR_NOTION_TOKEN"
-NOTION_DATABASE_ID = "YOUR_NOTION_DATABASE_ID"
-DB_PATH = "risk_manager.db"
+from config import (
+    CLIENT_ID,
+    DB_PATH,
+    FLEX_QUERY_ID,
+    FLEX_TOKEN,
+    MAX_POSITION_SIZE_PCT,
+    MAX_STOP_PCT,
+    MY_TELEGRAM_CHAT_ID,
+    RISK_MAX_DRAWDOWN_GREEN,
+    RISK_MAX_DRAWDOWN_YELLOW,
+    RISK_PCT_PER_TRADE,
+    TG_BOT_TOKEN,
+    TWS_HOST,
+    TWS_PORT,
+)
+from database import (
+    delete_pending_intent,
+    ensure_schema,
+    insert_shadow_ledger,
+    load_pending_intent,
+    save_pending_intent,
+    upsert_account_state,
+)
+from notion_api import push_to_notion
 
-# ==========================================
-# 🛡️ 风控参数
-# ==========================================
-RISK_MAX_DRAWDOWN_GREEN = 0.05
-RISK_MAX_DRAWDOWN_YELLOW = 0.10
-RISK_PCT_PER_TRADE = 0.003
-MAX_POSITION_SIZE_PCT = 0.40
-MAX_STOP_PCT = 0.03
-
-# 全局实例
 ib = IB()
-notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN != "YOUR_NOTION_TOKEN" else None
 
 
-# ==========================================
-# 数据库
-# ==========================================
-def ensure_schema() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS shadow_ledger (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            tranche_id TEXT,
-            side TEXT NOT NULL,
-            quantity REAL NOT NULL,
-            entry_price REAL NOT NULL,
-            initial_stop REAL NOT NULL,
-            current_stop REAL NOT NULL,
-            status TEXT NOT NULL DEFAULT 'OPEN',
-            exit_price REAL,
-            realized_pnl REAL,
-            setup_tag TEXT,
-            spy_context TEXT,
-            create_time DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS account_state (
-            date DATE PRIMARY KEY,
-            locked_equity REAL NOT NULL,
-            high_water_mark REAL NOT NULL,
-            risk_light TEXT NOT NULL
-        )
-        """
-    )
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pending_intents (
-            intent_id TEXT PRIMARY KEY,
-            symbol TEXT NOT NULL,
-            stop_price REAL NOT NULL,
-            setup_tag TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            quantity REAL NOT NULL,
-            spy_context TEXT,
-            create_time DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-# ==========================================
-# 核心功能
-# ==========================================
 def require_auth(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
@@ -122,27 +58,6 @@ def require_auth(func):
         return await func(update, context)
 
     return wrapper
-
-
-def push_to_notion(trade_id, symbol, realized_pnl, setup_tag, confession=""):
-    if not notion or NOTION_DATABASE_ID == "YOUR_NOTION_DATABASE_ID":
-        return
-    try:
-        notion.pages.create(
-            parent={"database_id": NOTION_DATABASE_ID},
-            properties={
-                "Tranche ID": {"title": [{"text": {"content": f"{symbol}-{trade_id}"}}]},
-                "Symbol": {"select": {"name": symbol}},
-                "Realized P&L": {"number": realized_pnl},
-                "Setup Tag": {
-                    "multi_select": [{"name": setup_tag}] if setup_tag else []
-                },
-                "Confession": {"rich_text": [{"text": {"content": confession}}]},
-                "Violation": {"checkbox": True if confession else False},
-            },
-        )
-    except Exception as e:
-        print(f"❌ Notion 推送失败: {e}")
 
 
 async def ensure_ib_connected() -> bool:
@@ -163,25 +78,19 @@ async def fetch_entry_price(symbol: str):
     qualified = await ib.qualifyContractsAsync(contract)
     if not qualified:
         return None, ""
-    ticker = ib.reqMktData(contract, "", False, False)
-    source = ""
-    price = None
-    for _ in range(24):
-        await asyncio.sleep(0.25)
+
+    tickers = await ib.reqTickersAsync(contract)
+    if tickers:
+        ticker = tickers[0]
         if ticker.ask and ticker.ask > 0:
-            price = float(ticker.ask)
-            source = "ask"
-            break
+            return float(ticker.ask), "ask"
         if ticker.last and ticker.last > 0:
-            price = float(ticker.last)
-            source = "last"
-            break
+            return float(ticker.last), "last"
         if ticker.close and ticker.close > 0:
-            price = float(ticker.close)
-            source = "close"
-            break
-    ib.cancelMktData(contract)
-    return price, source
+            return float(ticker.close), "close"
+        if ticker.marketPrice() > 0:
+            return float(ticker.marketPrice()), "market"
+    return None, ""
 
 
 async def fetch_account_equity() -> float:
@@ -220,20 +129,20 @@ async def fetch_spy_context() -> str:
     return await loop.run_in_executor(None, fetch_spy_context_sync)
 
 
-def calculate_risk_light(db_connection, current_total_equity: float):
-    cursor = db_connection.cursor()
-    cursor.execute(
+async def calculate_risk_light(db_connection, current_total_equity: float):
+    cursor = await db_connection.execute(
         "SELECT symbol, SUM(quantity * entry_price) AS pos_value "
         "FROM shadow_ledger WHERE status='OPEN' GROUP BY symbol"
     )
-    for row in cursor.fetchall():
+    rows = await cursor.fetchall()
+    for row in rows:
         pos_value = row["pos_value"] or 0.0
         if pos_value > current_total_equity * MAX_POSITION_SIZE_PCT:
             return f"🚨 危险！{row['symbol']} 超过 40% 上限。", 0.0
 
-    cursor.execute("SELECT MAX(high_water_mark) FROM account_state")
-    row = cursor.fetchone()
-    hwm = row[0] if row and row[0] else current_total_equity
+    cursor = await db_connection.execute("SELECT MAX(high_water_mark) FROM account_state")
+    row = await cursor.fetchone()
+    hwm = float(row[0]) if row and row[0] else current_total_equity
     if current_total_equity > hwm:
         hwm = current_total_equity
 
@@ -248,77 +157,11 @@ def calculate_risk_light(db_connection, current_total_equity: float):
     return "🔴 红灯", 0.0
 
 
-def upsert_account_state(db_connection, equity: float, risk_light: str) -> None:
-    today = datetime.date.today().isoformat()
-    cursor = db_connection.cursor()
-    cursor.execute("SELECT high_water_mark FROM account_state WHERE date=?", (today,))
-    row = cursor.fetchone()
-    if row:
-        hwm = max(float(row["high_water_mark"]), equity)
-        cursor.execute(
-            "UPDATE account_state SET locked_equity=?, high_water_mark=?, risk_light=? WHERE date=?",
-            (equity, hwm, risk_light, today),
-        )
-    else:
-        cursor.execute("SELECT MAX(high_water_mark) FROM account_state")
-        prev = cursor.fetchone()
-        prev_hwm = float(prev[0]) if prev and prev[0] else equity
-        hwm = max(prev_hwm, equity)
-        cursor.execute(
-            "INSERT INTO account_state (date, locked_equity, high_water_mark, risk_light) VALUES (?, ?, ?, ?)",
-            (today, equity, hwm, risk_light),
-        )
-    db_connection.commit()
-
-
 def calc_share_quantity(risk_budget: float, entry_price: float, stop_price: float) -> int:
     risk_per_share = abs(entry_price - stop_price)
     if risk_per_share <= 0 or risk_budget <= 0:
         return 0
     return int(risk_budget / risk_per_share)
-
-
-def save_pending_intent(conn, intent_id, symbol, stop_price, setup_tag, entry_price, quantity, spy_context):
-    conn.execute(
-        "INSERT INTO pending_intents "
-        "(intent_id, symbol, stop_price, setup_tag, entry_price, quantity, spy_context) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (intent_id, symbol, stop_price, setup_tag, entry_price, float(quantity), spy_context),
-    )
-    conn.commit()
-
-
-def load_pending_intent(conn, intent_id):
-    cur = conn.execute("SELECT * FROM pending_intents WHERE intent_id=?", (intent_id,))
-    return cur.fetchone()
-
-
-def delete_pending_intent(conn, intent_id):
-    conn.execute("DELETE FROM pending_intents WHERE intent_id=?", (intent_id,))
-    conn.commit()
-
-
-def count_open_tranches(conn, symbol):
-    cur = conn.execute(
-        "SELECT COUNT(*) FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
-        (symbol,),
-    )
-    return int(cur.fetchone()[0])
-
-
-def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price, quantity, spy_context):
-    tranche_num = count_open_tranches(conn, symbol) + 1
-    tranche_id = f"T{tranche_num}"
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO shadow_ledger "
-        "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, "
-        "status, setup_tag, spy_context) "
-        "VALUES (?, ?, 'LONG', ?, ?, ?, ?, 'OPEN', ?, ?)",
-        (symbol, tranche_id, quantity, entry_price, stop_price, stop_price, setup_tag, spy_context),
-    )
-    conn.commit()
-    return int(cur.lastrowid)
 
 
 def _flex_trade_attr(trade, *names, default=""):
@@ -329,7 +172,7 @@ def _flex_trade_attr(trade, *names, default=""):
     return default
 
 
-async def sync_flex_query(db_connection):
+async def sync_flex_query():
     print("⏳ 开始执行盘前静默对账协议...")
     if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
         print("💤 未配置 Flex Token，跳过对账。")
@@ -352,48 +195,137 @@ async def sync_flex_query(db_connection):
 
     try:
         report = FlexReport(FLEX_TOKEN, FLEX_QUERY_ID)
-        cursor = db_connection.cursor()
-        closed = 0
-        for trade in report.extract("Trade"):
-            symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
-            if not symbol:
-                continue
-            exec_price = float(_flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0)
-            realized_pnl = float(
-                _flex_trade_attr(
-                    trade,
-                    "fifoPnlRealized",
-                    "realizedPL",
-                    "realizedPnl",
-                    "RealizedP/L",
-                    default=0,
+        async with aiosqlite.connect(DB_PATH) as db_connection:
+            db_connection.row_factory = aiosqlite.Row
+            closed = 0
+            for trade in report.extract("Trade"):
+                symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
+                if not symbol:
+                    continue
+                exec_price = float(_flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0)
+                realized_pnl = float(
+                    _flex_trade_attr(
+                        trade,
+                        "fifoPnlRealized",
+                        "realizedPL",
+                        "realizedPnl",
+                        "RealizedP/L",
+                        default=0,
+                    )
+                    or 0
                 )
-                or 0
-            )
 
-            cursor.execute(
-                "SELECT id, setup_tag FROM shadow_ledger WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
-                (symbol,),
-            )
-            row = cursor.fetchone()
-            if row:
-                trade_id = row["id"]
-                setup_tag = row["setup_tag"] if row["setup_tag"] else ""
-                cursor.execute(
-                    "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
-                    (exec_price, realized_pnl, trade_id),
+                cursor = await db_connection.execute(
+                    "SELECT id, setup_tag FROM shadow_ledger WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
+                    (symbol,),
                 )
-                push_to_notion(trade_id, symbol, realized_pnl, setup_tag)
-                closed += 1
-        db_connection.commit()
-        print(f"✅ Flex 对账完成，关闭 {closed} 条影子仓位。")
+                row = await cursor.fetchone()
+                if row:
+                    trade_id = row["id"]
+                    setup_tag = row["setup_tag"] if row["setup_tag"] else ""
+                    await db_connection.execute(
+                        "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
+                        (exec_price, realized_pnl, trade_id),
+                    )
+                    asyncio.create_task(push_to_notion(trade_id, symbol, realized_pnl, setup_tag))
+                    closed += 1
+            await db_connection.commit()
+            print(f"✅ Flex 对账完成，关闭 {closed} 条影子仓位。")
     except Exception as e:
         print(f"❌ Flex 账单拉取失败: {e}")
 
 
-# ==========================================
-# Telegram 指令
-# ==========================================
+async def reconcile_physical_positions(tg_application):
+    print("🔍 启动物理仓位深度对账...")
+    if not ib.isConnected():
+        print("⚠️ TWS 未连接，跳过物理对账。")
+        return
+
+    try:
+        positions = await ib.reqPositionsAsync()
+    except Exception as e:
+        print(f"❌ 物理持仓拉取失败: {e}")
+        return
+
+    physical_inventory = {}
+    for pos in positions:
+        if pos.contract.secType == "STK" and pos.position != 0:
+            physical_inventory[pos.contract.symbol] = float(pos.position)
+
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+
+        cursor = await conn.execute(
+            "SELECT symbol, quantity FROM shadow_ledger WHERE status='OPEN'"
+        )
+        ledger_positions = await cursor.fetchall()
+
+        expected_inventory = {}
+        for row in ledger_positions:
+            sym = row["symbol"]
+            expected_inventory[sym] = expected_inventory.get(sym, 0.0) + float(row["quantity"])
+
+        ghost_alerts = []
+
+        for sym, expected_qty in expected_inventory.items():
+            actual_qty = physical_inventory.get(sym, 0.0)
+            if actual_qty < expected_qty:
+                discrepancy = expected_qty - actual_qty
+                ghost_alerts.append(
+                    f"👻 **发现幽灵平仓 [{sym}]**\n"
+                    f"账本预期: {expected_qty} 股 | TWS实际: {actual_qty} 股\n"
+                    f"*(系统已强制启动 FIFO 清剿修复)*"
+                )
+
+                cursor = await conn.execute(
+                    "SELECT id, quantity, setup_tag FROM shadow_ledger "
+                    "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
+                    (sym,),
+                )
+                open_tranches = await cursor.fetchall()
+                remaining_to_close = discrepancy
+
+                for tranche in open_tranches:
+                    if remaining_to_close <= 0:
+                        break
+                    t_id = tranche["id"]
+                    t_qty = float(tranche["quantity"])
+
+                    if t_qty <= remaining_to_close:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET status='CLOSED', exit_price=0, realized_pnl=0 WHERE id=?",
+                            (t_id,),
+                        )
+                        remaining_to_close -= t_qty
+                    else:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET quantity=? WHERE id=?",
+                            (t_qty - remaining_to_close, t_id),
+                        )
+                        remaining_to_close = 0
+
+        for sym, actual_qty in physical_inventory.items():
+            expected_qty = expected_inventory.get(sym, 0.0)
+            if actual_qty > expected_qty:
+                ghost_alerts.append(
+                    f"⚠️ **发现未授权物理仓位 [{sym}]**\n"
+                    f"账本预期: {expected_qty} 股 | TWS实际: {actual_qty} 股\n"
+                    f"*(请立刻使用 /init 或 /override 录入系统！)*"
+                )
+
+        await conn.commit()
+
+        if ghost_alerts:
+            alert_msg = "🚨 **物理对账警告 (已处理)** 🚨\n\n" + "\n\n".join(ghost_alerts)
+            print("🚨 发生对账不一致，已发送 Telegram 警报。")
+            await tg_application.bot.send_message(
+                chat_id=MY_TELEGRAM_CHAT_ID,
+                text=alert_msg,
+            )
+        else:
+            print("✅ 物理仓位与影子账本 100% 吻合，防线坚固。")
+
+
 @require_auth
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -412,15 +344,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = await fetch_account_equity()
-    conn = get_db()
-    try:
-        risk_light, risk_budget = calculate_risk_light(conn, equity)
-        upsert_account_state(conn, equity, risk_light)
-        cur = conn.execute(
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        risk_light, risk_budget = await calculate_risk_light(conn, equity)
+        await upsert_account_state(conn, equity, risk_light)
+
+        cur = await conn.execute(
             "SELECT symbol, tranche_id, quantity, entry_price, current_stop, setup_tag "
             "FROM shadow_ledger WHERE status='OPEN' ORDER BY symbol, create_time"
         )
-        rows = cur.fetchall()
+        rows = await cur.fetchall()
+
         lines = [
             f"💰 净值: ${equity:,.2f}",
             f"🚦 风控灯: {risk_light}",
@@ -438,18 +372,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"stop={r['current_stop']:.2f} [{r['setup_tag']}]"
                 )
         await update.message.reply_text("\n".join(lines))
-    finally:
-        conn.close()
 
 
 @require_auth
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db()
-    try:
-        await sync_flex_query(conn)
-        await update.message.reply_text("✅ Flex 对账任务已执行，详见控制台日志。")
-    finally:
-        conn.close()
+    await sync_flex_query()
+    await update.message.reply_text("✅ Flex 对账任务已执行，详见控制台日志。")
 
 
 @require_auth
@@ -479,10 +407,10 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         equity = await fetch_account_equity()
-        conn = get_db()
-        try:
-            risk_light, risk_budget = calculate_risk_light(conn, equity)
-            upsert_account_state(conn, equity, risk_light)
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            risk_light, risk_budget = await calculate_risk_light(conn, equity)
+            await upsert_account_state(conn, equity, risk_light)
             if risk_budget <= 0:
                 await update.message.reply_text(f"🚨 风控灯 {risk_light}，当前禁止新开仓。")
                 return
@@ -494,12 +422,10 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             spy_context = await fetch_spy_context()
             intent_id = uuid.uuid4().hex[:8]
-            save_pending_intent(
+            await save_pending_intent(
                 conn, intent_id, symbol, stop_price, setup_tag,
                 entry_price, quantity, spy_context,
             )
-        finally:
-            conn.close()
 
         notional = entry_price * quantity
         risk_dollar = abs(entry_price - stop_price) * quantity
@@ -538,24 +464,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("CANCEL:"):
         intent_id = data.split(":", 1)[1]
-        conn = get_db()
-        try:
-            delete_pending_intent(conn, intent_id)
-        finally:
-            conn.close()
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await delete_pending_intent(conn, intent_id)
         await query.edit_message_text(text="🛑 已放弃记账。")
         return
 
     if data.startswith("CONFIRM:"):
         intent_id = data.split(":", 1)[1]
-        conn = get_db()
-        try:
-            pending = load_pending_intent(conn, intent_id)
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            pending = await load_pending_intent(conn, intent_id)
             if pending is None:
                 await query.edit_message_text(text="⚠️ 意图已过期，请重新 /init。")
                 return
 
-            row_id = insert_shadow_ledger(
+            row_id = await insert_shadow_ledger(
                 conn,
                 pending["symbol"],
                 float(pending["stop_price"]),
@@ -564,8 +487,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 float(pending["quantity"]),
                 pending["spy_context"] or "",
             )
-            delete_pending_intent(conn, intent_id)
-            push_to_notion(row_id, pending["symbol"], 0.0, pending["setup_tag"])
+            await delete_pending_intent(conn, intent_id)
+            asyncio.create_task(
+                push_to_notion(row_id, pending["symbol"], 0.0, pending["setup_tag"])
+            )
 
             await query.edit_message_text(
                 text=(
@@ -574,8 +499,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"@ {pending['entry_price']:.2f} stop {pending['stop_price']:.2f}"
                 )
             )
-        finally:
-            conn.close()
 
 
 @require_auth
@@ -588,28 +511,28 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = args[0].upper()
         reason = " ".join(args[1:])
 
-        conn = get_db()
-        try:
-            cur = conn.execute(
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
                 "SELECT id FROM shadow_ledger WHERE symbol=? AND status='OPEN' AND initial_stop=0.0",
                 (symbol,),
             )
-            rows = cur.fetchall()
+            rows = await cur.fetchall()
             if not rows:
                 await update.message.reply_text(f"ℹ️ {symbol} 无待坦白的越权仓位。")
                 return
 
-            conn.execute(
+            await conn.execute(
                 "UPDATE shadow_ledger SET "
                 "initial_stop=entry_price*0.9, current_stop=entry_price*0.9, setup_tag='FOMO' "
                 "WHERE symbol=? AND status='OPEN' AND initial_stop=0.0",
                 (symbol,),
             )
-            conn.commit()
+            await conn.commit()
             for row in rows:
-                push_to_notion(row["id"], symbol, 0.0, "FOMO", confession=reason)
-        finally:
-            conn.close()
+                asyncio.create_task(
+                    push_to_notion(row["id"], symbol, 0.0, "FOMO", confession=reason)
+                )
 
         await update.message.reply_text(
             f"💀 已记录坦白: {symbol} - {reason}\n这笔交易已被接纳，但打上了违规标签。"
@@ -628,13 +551,13 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         symbol, new_stop = args[0].upper(), float(args[1])
 
-        conn = get_db()
-        try:
-            cur = conn.execute(
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
                 "SELECT id, entry_price FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                 (symbol,),
             )
-            rows = cur.fetchall()
+            rows = await cur.fetchall()
             if not rows:
                 await update.message.reply_text(f"ℹ️ {symbol} 无 OPEN 仓位。")
                 return
@@ -648,13 +571,11 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
 
-            conn.execute(
+            await conn.execute(
                 "UPDATE shadow_ledger SET current_stop=? WHERE symbol=? AND status='OPEN'",
                 (new_stop, symbol),
             )
-            conn.commit()
-        finally:
-            conn.close()
+            await conn.commit()
 
         await update.message.reply_text(f"✅ {symbol} 止损已更新为 {new_stop}，风险额度已重算。")
     except ValueError:
@@ -675,17 +596,17 @@ async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ 比例必须大于 0。")
             return
 
-        conn = get_db()
-        try:
-            cur = conn.execute(
+        async with aiosqlite.connect(DB_PATH) as conn:
+            cur = await conn.execute(
                 "SELECT COUNT(*) FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                 (symbol,),
             )
-            if int(cur.fetchone()[0]) == 0:
+            row = await cur.fetchone()
+            if int(row[0]) == 0:
                 await update.message.reply_text(f"ℹ️ {symbol} 无 OPEN 仓位。")
                 return
 
-            conn.execute(
+            await conn.execute(
                 """
                 UPDATE shadow_ledger
                 SET quantity=quantity*?,
@@ -696,9 +617,7 @@ async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 """,
                 (ratio, ratio, ratio, ratio, symbol),
             )
-            conn.commit()
-        finally:
-            conn.close()
+            await conn.commit()
 
         await update.message.reply_text(f"✂️ {symbol} 已执行 1:{ratio} 拆/合股处理。")
     except ValueError:
@@ -716,33 +635,41 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         old_sym, new_sym = args[0].upper(), args[1].upper()
 
-        conn = get_db()
-        try:
-            cur = conn.execute(
+        async with aiosqlite.connect(DB_PATH) as conn:
+            cur = await conn.execute(
                 "SELECT COUNT(*) FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                 (old_sym,),
             )
-            if int(cur.fetchone()[0]) == 0:
+            row = await cur.fetchone()
+            if int(row[0]) == 0:
                 await update.message.reply_text(f"ℹ️ {old_sym} 无 OPEN 仓位。")
                 return
 
-            conn.execute(
+            await conn.execute(
                 "UPDATE shadow_ledger SET symbol=? WHERE symbol=? AND status='OPEN'",
                 (new_sym, old_sym),
             )
-            conn.commit()
-        finally:
-            conn.close()
+            await conn.commit()
 
         await update.message.reply_text(f"🔄 影子账本代码已更名: {old_sym} -> {new_sym}")
     except Exception as e:
         await update.message.reply_text(f"❌ 更名失败: {e}")
 
 
-# ==========================================
-# IB 成交监听 & 心跳
-# ==========================================
+def _dispatch_async(coro):
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(coro)
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(asyncio.create_task, coro)
+
+
 def on_execution(trade):
+    _dispatch_async(_async_on_execution(trade))
+
+
+async def _async_on_execution(trade):
     execution = trade.execution
     contract = trade.contract
     symbol = contract.symbol
@@ -750,77 +677,77 @@ def on_execution(trade):
     qty = float(execution.shares)
     price = float(execution.price)
 
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT id, side, quantity, entry_price FROM shadow_ledger "
-        "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
-        (symbol,),
-    )
-    open_tranches = cursor.fetchall()
-
-    opening = (
-        execution.side == "BOT"
-        and (not open_tranches or open_tranches[0]["side"] == "LONG")
-    ) or (
-        execution.side == "SLD"
-        and (not open_tranches or open_tranches[0]["side"] == "SHORT")
-    )
-
-    if opening:
-        today_str = datetime.datetime.now().strftime("%Y%m%d")
-        cursor.execute(
-            "SELECT id, quantity, entry_price FROM shadow_ledger "
-            "WHERE symbol=? AND side=? AND status='OPEN' AND strftime('%Y%m%d', create_time)=?",
-            (symbol, side, today_str),
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cursor = await conn.execute(
+            "SELECT id, side, quantity, entry_price FROM shadow_ledger "
+            "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
+            (symbol,),
         )
-        same_day_row = cursor.fetchone()
+        open_tranches = await cursor.fetchall()
 
-        if same_day_row:
-            row_id = same_day_row["id"]
-            old_qty = float(same_day_row["quantity"])
-            old_price = float(same_day_row["entry_price"])
-            new_qty = old_qty + qty
-            new_price = ((old_price * old_qty) + (price * qty)) / new_qty
-            cursor.execute(
-                "UPDATE shadow_ledger SET quantity=?, entry_price=? WHERE id=?",
-                (new_qty, new_price, row_id),
+        opening = (
+            execution.side == "BOT"
+            and (not open_tranches or open_tranches[0]["side"] == "LONG")
+        ) or (
+            execution.side == "SLD"
+            and (not open_tranches or open_tranches[0]["side"] == "SHORT")
+        )
+
+        if opening:
+            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            cursor = await conn.execute(
+                "SELECT id, quantity, entry_price FROM shadow_ledger "
+                "WHERE symbol=? AND side=? AND status='OPEN' AND strftime('%Y%m%d', create_time)=?",
+                (symbol, side, today_str),
             )
-        else:
-            tranche_id = f"T{len(open_tranches) + 1}"
-            cursor.execute(
-                "INSERT INTO shadow_ledger "
-                "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status) "
-                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN')",
-                (symbol, tranche_id, side, qty, price),
-            )
-    else:
-        remaining_exit_qty = qty
-        for row in open_tranches:
-            if remaining_exit_qty <= 0:
-                break
-            t_id = row["id"]
-            t_qty = float(row["quantity"])
-            if t_qty <= remaining_exit_qty:
-                cursor.execute("SELECT setup_tag FROM shadow_ledger WHERE id=?", (t_id,))
-                tag_row = cursor.fetchone()
-                setup_tag = tag_row["setup_tag"] if tag_row and tag_row["setup_tag"] else ""
-                cursor.execute(
-                    "UPDATE shadow_ledger SET status='CLOSED', exit_price=? WHERE id=?",
-                    (price, t_id),
+            same_day_row = await cursor.fetchone()
+
+            if same_day_row:
+                row_id = same_day_row["id"]
+                old_qty = float(same_day_row["quantity"])
+                old_price = float(same_day_row["entry_price"])
+                new_qty = old_qty + qty
+                new_price = ((old_price * old_qty) + (price * qty)) / new_qty
+                await conn.execute(
+                    "UPDATE shadow_ledger SET quantity=?, entry_price=? WHERE id=?",
+                    (new_qty, new_price, row_id),
                 )
-                push_to_notion(t_id, symbol, 0.0, setup_tag)
-                remaining_exit_qty -= t_qty
             else:
-                cursor.execute(
-                    "UPDATE shadow_ledger SET quantity=? WHERE id=?",
-                    (t_qty - remaining_exit_qty, t_id),
+                tranche_id = f"T{len(open_tranches) + 1}"
+                await conn.execute(
+                    "INSERT INTO shadow_ledger "
+                    "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status) "
+                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN')",
+                    (symbol, tranche_id, side, qty, price),
                 )
-                remaining_exit_qty = 0
+        else:
+            remaining_exit_qty = qty
+            for row in open_tranches:
+                if remaining_exit_qty <= 0:
+                    break
+                t_id = row["id"]
+                t_qty = float(row["quantity"])
+                if t_qty <= remaining_exit_qty:
+                    cursor = await conn.execute(
+                        "SELECT setup_tag FROM shadow_ledger WHERE id=?", (t_id,)
+                    )
+                    tag_row = await cursor.fetchone()
+                    setup_tag = tag_row["setup_tag"] if tag_row and tag_row["setup_tag"] else ""
+                    await conn.execute(
+                        "UPDATE shadow_ledger SET status='CLOSED', exit_price=? WHERE id=?",
+                        (price, t_id),
+                    )
+                    asyncio.create_task(push_to_notion(t_id, symbol, 0.0, setup_tag))
+                    remaining_exit_qty -= t_qty
+                else:
+                    await conn.execute(
+                        "UPDATE shadow_ledger SET quantity=? WHERE id=?",
+                        (t_qty - remaining_exit_qty, t_id),
+                    )
+                    remaining_exit_qty = 0
 
-    conn.commit()
-    conn.close()
+        await conn.commit()
 
 
 async def heartbeat_2300(tg_application):
@@ -832,14 +759,14 @@ async def heartbeat_2300(tg_application):
             target += datetime.timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
 
-        conn = get_db()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
+        async with aiosqlite.connect(DB_PATH) as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
                 "SELECT symbol, side, quantity FROM shadow_ledger "
                 "WHERE status='OPEN' AND initial_stop = 0.0"
             )
-            for row in cursor.fetchall():
+            rows = await cursor.fetchall()
+            for row in rows:
                 await tg_application.bot.send_message(
                     chat_id=MY_TELEGRAM_CHAT_ID,
                     text=(
@@ -847,8 +774,6 @@ async def heartbeat_2300(tg_application):
                         f"请发送 /override {row['symbol']} [坦白理由]！"
                     ),
                 )
-        finally:
-            conn.close()
 
 
 async def ib_keepalive():
@@ -860,21 +785,16 @@ async def ib_keepalive():
         await asyncio.sleep(30)
 
 
-# ==========================================
-# 启动入口
-# ==========================================
-async def _startup_flex_sync() -> None:
-    conn = get_db()
-    try:
-        await sync_flex_query(conn)
-    finally:
-        conn.close()
+async def _startup_sequence() -> None:
+    await ensure_schema()
+    await sync_flex_query()
 
 
 async def _post_init(app: Application) -> None:
     if await ensure_ib_connected():
         ib.execDetailsEvent += on_execution
-        print("✅ TWS 已连接，成交监听已启动。")
+        print("✅ TWS 已连接，异步成交监听已启动。")
+        await reconcile_physical_positions(app)
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
     asyncio.create_task(heartbeat_2300(app))
@@ -883,8 +803,7 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    ensure_schema()
-    asyncio.run(_startup_flex_sync())
+    asyncio.run(_startup_sequence())
 
     tg_app = (
         Application.builder()
