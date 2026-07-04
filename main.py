@@ -1,8 +1,21 @@
 import asyncio
 import datetime
 import sqlite3
+import sys
 import uuid
 from zoneinfo import ZoneInfo
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 import pandas_market_calendars as mcal
 from ib_insync import IB, FlexReport, Stock, util
@@ -17,7 +30,7 @@ MY_TELEGRAM_CHAT_ID = 123456789
 TG_BOT_TOKEN = "YOUR_TG_TOKEN"
 TWS_HOST = "127.0.0.1"
 TWS_PORT = 7497
-CLIENT_ID = 0
+CLIENT_ID = 2
 FLEX_TOKEN = "YOUR_FLEX_TOKEN"
 FLEX_QUERY_ID = "YOUR_FLEX_QUERY_ID"
 NOTION_TOKEN = "YOUR_NOTION_TOKEN"
@@ -136,7 +149,7 @@ async def ensure_ib_connected() -> bool:
     if ib.isConnected():
         return True
     try:
-        await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=CLIENT_ID)
+        await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=CLIENT_ID, timeout=5)
         return True
     except Exception as e:
         print(f"TWS 未连接: {e}")
@@ -174,22 +187,16 @@ async def fetch_entry_price(symbol: str):
 async def fetch_account_equity() -> float:
     if not await ensure_ib_connected():
         return 0.0
-    tags = ib.accountSummary()
-    for row in tags:
-        if row.tag == "NetLiquidation" and row.currency == "USD":
-            try:
-                return float(row.value)
-            except ValueError:
-                pass
-    ib.reqAccountSummary()
-    await asyncio.sleep(1.0)
-    tags = ib.accountSummary()
-    for row in tags:
-        if row.tag == "NetLiquidation" and row.currency == "USD":
-            try:
-                return float(row.value)
-            except ValueError:
-                pass
+    try:
+        tags = await ib.accountSummaryAsync()
+        for row in tags:
+            if row.tag == "NetLiquidation" and row.currency == "USD":
+                try:
+                    return float(row.value)
+                except ValueError:
+                    pass
+    except Exception as e:
+        print(f"净值读取失败: {e}")
     return 0.0
 
 
@@ -314,6 +321,14 @@ def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price, quant
     return int(cur.lastrowid)
 
 
+def _flex_trade_attr(trade, *names, default=""):
+    for name in names:
+        val = getattr(trade, name, None)
+        if val is not None and val != "":
+            return val
+    return default
+
+
 async def sync_flex_query(db_connection):
     print("⏳ 开始执行盘前静默对账协议...")
     if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
@@ -340,11 +355,21 @@ async def sync_flex_query(db_connection):
         cursor = db_connection.cursor()
         closed = 0
         for trade in report.extract("Trade"):
-            symbol = trade.getAttribute("symbol")
+            symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
             if not symbol:
                 continue
-            exec_price = float(trade.getAttribute("tradePrice") or 0)
-            realized_pnl = float(trade.getAttribute("fifoPnlRealized") or 0)
+            exec_price = float(_flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0)
+            realized_pnl = float(
+                _flex_trade_attr(
+                    trade,
+                    "fifoPnlRealized",
+                    "realizedPL",
+                    "realizedPnl",
+                    "RealizedP/L",
+                    default=0,
+                )
+                or 0
+            )
 
             cursor.execute(
                 "SELECT id, setup_tag FROM shadow_ledger WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
@@ -838,23 +863,35 @@ async def ib_keepalive():
 # ==========================================
 # 启动入口
 # ==========================================
-async def main():
-    util.patchAsyncio()
-    ensure_schema()
-
+async def _startup_flex_sync() -> None:
     conn = get_db()
     try:
         await sync_flex_query(conn)
     finally:
         conn.close()
 
+
+async def _post_init(app: Application) -> None:
     if await ensure_ib_connected():
         ib.execDetailsEvent += on_execution
         print("✅ TWS 已连接，成交监听已启动。")
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
+    asyncio.create_task(heartbeat_2300(app))
+    asyncio.create_task(ib_keepalive())
+    print("✅ Telegram Bot 已启动。")
 
-    tg_app = Application.builder().token(TG_BOT_TOKEN).build()
+
+def main() -> None:
+    ensure_schema()
+    asyncio.run(_startup_flex_sync())
+
+    tg_app = (
+        Application.builder()
+        .token(TG_BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("init", cmd_init))
@@ -866,17 +903,8 @@ async def main():
     tg_app.add_handler(CommandHandler("rename", cmd_rename))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
-    asyncio.create_task(heartbeat_2300(tg_app))
-    asyncio.create_task(ib_keepalive())
-
-    await tg_app.initialize()
-    await tg_app.start()
-    await tg_app.updater.start_polling()
-    print("✅ Telegram Bot 已启动。")
-
-    while True:
-        await asyncio.sleep(3600)
+    tg_app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
