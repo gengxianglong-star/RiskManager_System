@@ -19,6 +19,8 @@ CSV_URL = (
 _CACHE_TTL = 300
 _cache: tuple[float, tuple[str, str, float]] | None = None
 
+REGIME_OFFLINE_LABEL = "📡 雷达离线"
+
 
 def _parse_date(value: str) -> str | None:
     text = (value or "").strip()
@@ -130,7 +132,11 @@ async def fetch_market_regime() -> tuple[str, str, float]:
         rows = list(csv.reader(text.splitlines()))
         latest_row = _pick_latest_row(rows)
         if not latest_row:
-            result = ("⚪ UNKNOWN", "无法解析宽度数据", 0.5)
+            result = (
+                REGIME_OFFLINE_LABEL,
+                "Google Sheet 无法解析宽度数据，仓位按正常满额(1.0x)执行",
+                1.0,
+            )
         else:
             result = _derive_regime(
                 _num(latest_row, 1),
@@ -142,7 +148,11 @@ async def fetch_market_regime() -> tuple[str, str, float]:
                 _num(latest_row, 14),
             )
     except Exception as e:
-        result = ("⚪ ERROR", f"数据获取失败: {e}", 0.5)
+        result = (
+            REGIME_OFFLINE_LABEL,
+            f"Google Sheet 连接失败: {e}，仓位按正常满额(1.0x)执行",
+            1.0,
+        )
 
     _cache = (now, result)
     return result

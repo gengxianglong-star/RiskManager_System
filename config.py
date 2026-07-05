@@ -15,6 +15,9 @@ FLEX_QUERY_ID = os.getenv("FLEX_QUERY_ID", "YOUR_FLEX_QUERY_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "YOUR_NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "YOUR_NOTION_DATABASE_ID")
 DB_PATH = os.getenv("DB_PATH", "risk_manager.db")
+DB_TIMEOUT = float(os.getenv("DB_TIMEOUT", "10.0"))
+# 狙击手协议与 account_state 日切时区（美股默认美东）
+TRADING_TZ = os.getenv("TRADING_TZ", "America/New_York")
 
 RISK_MAX_DRAWDOWN_GREEN = float(os.getenv("RISK_MAX_DRAWDOWN_GREEN", "0.05"))
 RISK_MAX_DRAWDOWN_YELLOW = float(os.getenv("RISK_MAX_DRAWDOWN_YELLOW", "0.10"))

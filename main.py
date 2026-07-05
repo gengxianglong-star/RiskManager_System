@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import sys
+import time
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -17,14 +18,30 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 import aiosqlite
+import nest_asyncio
 import pandas_market_calendars as mcal
-from ib_insync import IB, FlexReport, Stock, util
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from ib_insync import IB, FlexReport, MarketOrder, Stock, util
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+
+ib = IB()
+_background_tasks: set[asyncio.Task] = set()
+_tg_bot: Bot | None = None
+_ib_loop_patched = False
+
+
+def _patch_ib_asyncio_once() -> None:
+    """Telegram 先启动后再 patch，避免 httpx 报 AsyncLibraryNotFoundError。"""
+    global _ib_loop_patched
+    if _ib_loop_patched:
+        return
+    util.patchAsyncio()
+    nest_asyncio.apply()
+    _ib_loop_patched = True
+
 
 from config import (
     CLIENT_ID,
-    DB_PATH,
     FLEX_QUERY_ID,
     FLEX_TOKEN,
     MAX_POSITION_SIZE_PCT,
@@ -40,18 +57,40 @@ from config import (
     TWS_PORT,
 )
 from database import (
+    connect_db,
     delete_pending_intent,
     ensure_schema,
     insert_shadow_ledger,
     load_pending_intent,
     save_pending_intent,
+    trading_now,
     upsert_account_state,
     get_today_trade_count,
 )
-from market_regime import fetch_market_regime
+from market_regime import REGIME_OFFLINE_LABEL, fetch_market_regime
 from notion_api import push_to_notion
 
-ib = IB()
+
+def bind_tg_bot(bot: Bot) -> None:
+    global _tg_bot
+    _tg_bot = bot
+
+
+async def _notify_user(text: str) -> None:
+    if _tg_bot is None:
+        print(f"TG 未绑定，跳过通知: {text[:80]}...")
+        return
+    try:
+        await _tg_bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        print(f"TG 发送失败: {e}")
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
 
 
 def require_auth(func):
@@ -67,6 +106,7 @@ def require_auth(func):
 async def ensure_ib_connected() -> bool:
     if ib.isConnected():
         return True
+    _patch_ib_asyncio_once()
     try:
         await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=CLIENT_ID, timeout=5)
         return True
@@ -148,6 +188,66 @@ def calc_share_quantity(risk_budget: float, entry_price: float, stop_price: floa
     return int(risk_budget / risk_per_share)
 
 
+async def validate_pending_entry(
+    conn,
+    entry_price: float,
+    stop_price: float,
+    quantity: float,
+    equity: float,
+) -> str | None:
+    """确认入账前二次校验，通过返回 None，否则返回拒绝文案。"""
+    today_count = await get_today_trade_count(conn)
+    if today_count >= MAX_DAILY_TRADES:
+        return (
+            f"🛑 **狙击手协议触发！**\n"
+            f"今日弹夹已打空 ({today_count}/{MAX_DAILY_TRADES})。请重新 /init。"
+        )
+
+    risk_light, base_risk_budget = await calculate_risk_light(conn, equity)
+    if base_risk_budget <= 0:
+        return f"🚨 风控灯 {risk_light}，当前禁止新开仓。请重新 /init。"
+
+    _, _, risk_mult = await fetch_market_regime()
+    if risk_mult == 0.0:
+        return "🛑 **宏观环境一票否决！** Bear Thrust 下禁止建仓。请重新 /init。"
+
+    if entry_price > 0:
+        risk_pct = abs(entry_price - stop_price) / entry_price
+        if risk_pct > MAX_STOP_PCT:
+            return (
+                f"🚨 止损距离 {risk_pct * 100:.2f}% 超过 {MAX_STOP_PCT * 100:.0f}% 上限。"
+                f"请重新 /init。"
+            )
+
+    cursor = await conn.execute(
+        "SELECT entry_price, current_stop, quantity FROM shadow_ledger WHERE status='OPEN'"
+    )
+    open_positions = await cursor.fetchall()
+    current_total_risk = 0.0
+    for pos in open_positions:
+        pos_entry = float(pos["entry_price"])
+        pos_stop = float(pos["current_stop"])
+        pos_qty = float(pos["quantity"])
+        current_total_risk += max(0.0, abs(pos_entry - pos_stop) * pos_qty)
+
+    new_trade_risk = abs(entry_price - stop_price) * quantity
+    projected_total_risk = current_total_risk + new_trade_risk
+    max_allowed_risk = equity * MAX_OVERNIGHT_RISK_PCT
+    if projected_total_risk > max_allowed_risk:
+        pct_str = (
+            f"{(projected_total_risk / equity) * 100:.2f}%"
+            if equity > 0
+            else "N/A"
+        )
+        return (
+            f"🛑 **隔夜风险总闸触发！**\n"
+            f"合并后风险 ${projected_total_risk:.2f} ({pct_str})，"
+            f"超过极限 {MAX_OVERNIGHT_RISK_PCT * 100:.2f}%。请重新 /init。"
+        )
+
+    return None
+
+
 def _flex_trade_attr(trade, *names, default=""):
     for name in names:
         val = getattr(trade, name, None)
@@ -178,8 +278,11 @@ async def sync_flex_query():
         return
 
     try:
-        report = FlexReport(FLEX_TOKEN, FLEX_QUERY_ID)
-        async with aiosqlite.connect(DB_PATH) as db_connection:
+        loop = asyncio.get_running_loop()
+        report = await loop.run_in_executor(
+            None, lambda: FlexReport(FLEX_TOKEN, FLEX_QUERY_ID)
+        )
+        async with connect_db() as db_connection:
             db_connection.row_factory = aiosqlite.Row
             closed = 0
             for trade in report.extract("Trade"):
@@ -211,7 +314,7 @@ async def sync_flex_query():
                         "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
                         (exec_price, realized_pnl, trade_id),
                     )
-                    asyncio.create_task(push_to_notion(trade_id, symbol, realized_pnl, setup_tag))
+                    _spawn_background_task(push_to_notion(trade_id, symbol, realized_pnl, setup_tag))
                     closed += 1
             await db_connection.commit()
             print(f"✅ Flex 对账完成，关闭 {closed} 条影子仓位。")
@@ -236,7 +339,7 @@ async def reconcile_physical_positions(tg_application):
         if pos.contract.secType == "STK" and pos.position != 0:
             physical_inventory[pos.contract.symbol] = float(pos.position)
 
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with connect_db() as conn:
         conn.row_factory = aiosqlite.Row
 
         cursor = await conn.execute(
@@ -328,7 +431,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     equity = await fetch_account_equity()
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with connect_db() as conn:
         conn.row_factory = aiosqlite.Row
         risk_light, risk_budget = await calculate_risk_light(conn, equity)
         await upsert_account_state(conn, equity, risk_light)
@@ -391,7 +494,7 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         equity = await fetch_account_equity()
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
 
             today_count = await get_today_trade_count(conn)
@@ -431,7 +534,7 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pos_entry = float(pos["entry_price"])
                 pos_stop = float(pos["current_stop"])
                 pos_qty = float(pos["quantity"])
-                trade_risk = max(0.0, (pos_entry - pos_stop) * pos_qty)
+                trade_risk = max(0.0, abs(pos_entry - pos_stop) * pos_qty)
                 current_total_risk += trade_risk
 
             quantity = calc_share_quantity(dynamic_risk_budget, entry_price, stop_price)
@@ -479,8 +582,13 @@ async def cmd_init(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎯 今日剩余子弹: {MAX_DAILY_TRADES - today_count - 1} 发\n\n"
             f"📊 宏观环境雷达:\n"
             f"状态: {regime_tag} (仓位乘数 {risk_mult}x)\n"
-            f"洞察: {insight}\n\n"
-            f"确认合规？"
+            f"洞察: {insight}\n"
+            + (
+                f"\n⚠️ **宽度雷达离线**，仓位按正常 1.0x 执行，宏观判定非实时。\n"
+                if regime_tag == REGIME_OFFLINE_LABEL
+                else ""
+            )
+            + "\n确认合规？"
         )
         keyboard = [
             [InlineKeyboardButton("🟩 确认无误 (入账)", callback_data=f"CONFIRM:{intent_id}")],
@@ -507,18 +615,91 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("CANCEL:"):
         intent_id = data.split(":", 1)[1]
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             await delete_pending_intent(conn, intent_id)
         await query.edit_message_text(text="🛑 已放弃记账。")
         return
 
+    if data.startswith("KILL:"):
+        symbol = data.split(":", 1)[1].upper()
+
+        await query.edit_message_text(text=f"⏳ 正在执行安全锁清仓，请稍候 [{symbol}]...")
+
+        if not await ensure_ib_connected():
+            await query.edit_message_text(text="❌ TWS 未连接，清仓失败。请手动在 TWS 操作！")
+            return
+
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            qualified = await ib.qualifyContractsAsync(contract)
+            if not qualified:
+                await query.edit_message_text(text=f"❌ 无法验证合约 `{symbol}`。")
+                return
+
+            positions = await ib.reqPositionsAsync()
+            actual_qty = 0.0
+            for pos in positions:
+                if (
+                    pos.contract.secType == "STK"
+                    and pos.contract.symbol == symbol
+                    and pos.position != 0
+                ):
+                    actual_qty = float(pos.position)
+                    break
+
+            if actual_qty == 0:
+                await query.edit_message_text(
+                    text=f"ℹ️ {symbol} TWS 实盘持仓已为 0，跳过斩立决。"
+                )
+                return
+
+            canceled_count = 0
+            for trade in ib.trades():
+                if trade.contract.symbol == symbol and not trade.isDone():
+                    await ib.cancelOrderAsync(trade.order)
+                    canceled_count += 1
+
+            if canceled_count > 0:
+                await asyncio.sleep(1.5)
+
+            action = "SELL" if actual_qty > 0 else "BUY"
+            mkt_order = MarketOrder(action, abs(actual_qty))
+            await ib.placeOrderAsync(contract, mkt_order)
+
+            await query.edit_message_text(
+                text=(
+                    f"💀 **斩立决已成功执行 [{symbol}]**\n"
+                    f"已撤销 {canceled_count} 笔保护挂单\n"
+                    f"发送市价单: {action} {abs(actual_qty):.0f} 股。\n"
+                    f"*(系统将通过异步成交回报自动冲销账本)*"
+                )
+            )
+        except Exception as e:
+            await query.edit_message_text(text=f"❌ 斩立决发生异常: {e}")
+        return
+
     if data.startswith("CONFIRM:"):
         intent_id = data.split(":", 1)[1]
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
             pending = await load_pending_intent(conn, intent_id)
             if pending is None:
                 await query.edit_message_text(text="⚠️ 意图已过期，请重新 /init。")
+                return
+
+            equity = await fetch_account_equity()
+            reject_reason = await validate_pending_entry(
+                conn,
+                float(pending["entry_price"]),
+                float(pending["stop_price"]),
+                float(pending["quantity"]),
+                equity,
+            )
+            if reject_reason:
+                await delete_pending_intent(conn, intent_id)
+                await query.edit_message_text(
+                    text=f"{reject_reason}\n\n⚠️ 审查意图已作废，请重新 /init。"
+                )
                 return
 
             row_id = await insert_shadow_ledger(
@@ -531,7 +712,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending["spy_context"] or "",
             )
             await delete_pending_intent(conn, intent_id)
-            asyncio.create_task(
+            _spawn_background_task(
                 push_to_notion(row_id, pending["symbol"], 0.0, pending["setup_tag"])
             )
 
@@ -554,7 +735,7 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = args[0].upper()
         reason = " ".join(args[1:])
 
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 "SELECT id FROM shadow_ledger WHERE symbol=? AND status='OPEN' AND initial_stop=0.0",
@@ -573,7 +754,7 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await conn.commit()
             for row in rows:
-                asyncio.create_task(
+                _spawn_background_task(
                     push_to_notion(row["id"], symbol, 0.0, "FOMO", confession=reason)
                 )
 
@@ -594,7 +775,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         symbol, new_stop = args[0].upper(), float(args[1])
 
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
             cur = await conn.execute(
                 "SELECT id, entry_price FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
@@ -639,7 +820,7 @@ async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ 比例必须大于 0。")
             return
 
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                 (symbol,),
@@ -678,7 +859,7 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         old_sym, new_sym = args[0].upper(), args[1].upper()
 
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             cur = await conn.execute(
                 "SELECT COUNT(*) FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                 (old_sym,),
@@ -701,11 +882,11 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _dispatch_async(coro):
     try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(coro)
+        asyncio.get_running_loop()
+        _spawn_background_task(coro)
     except RuntimeError:
         loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(asyncio.create_task, coro)
+        loop.call_soon_threadsafe(_spawn_background_task, coro)
 
 
 def on_execution(trade):
@@ -719,51 +900,68 @@ async def _async_on_execution(trade):
     side = "LONG" if execution.side == "BOT" else "SHORT"
     qty = float(execution.shares)
     price = float(execution.price)
+    setup_tag = trade.order.orderRef if trade.order and trade.order.orderRef else ""
 
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with connect_db() as conn:
         conn.row_factory = aiosqlite.Row
         cursor = await conn.execute(
-            "SELECT id, side, quantity, entry_price FROM shadow_ledger "
+            "SELECT id, side, quantity, entry_price, setup_tag FROM shadow_ledger "
             "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
             (symbol,),
         )
         open_tranches = await cursor.fetchall()
 
-        opening = (
-            execution.side == "BOT"
-            and (not open_tranches or open_tranches[0]["side"] == "LONG")
-        ) or (
-            execution.side == "SLD"
-            and (not open_tranches or open_tranches[0]["side"] == "SHORT")
-        )
+        opening = not open_tranches or open_tranches[0]["side"] == side
 
         if opening:
-            today_str = datetime.datetime.now().strftime("%Y%m%d")
+            today_str = trading_now().strftime("%Y%m%d")
             cursor = await conn.execute(
-                "SELECT id, quantity, entry_price FROM shadow_ledger "
+                "SELECT id, quantity, entry_price, setup_tag FROM shadow_ledger "
                 "WHERE symbol=? AND side=? AND status='OPEN' AND strftime('%Y%m%d', create_time)=?",
                 (symbol, side, today_str),
             )
             same_day_row = await cursor.fetchone()
 
             if same_day_row:
-                row_id = same_day_row["id"]
                 old_qty = float(same_day_row["quantity"])
-                old_price = float(same_day_row["entry_price"])
+                old_entry = float(same_day_row["entry_price"])
+                old_tag = same_day_row["setup_tag"] or ""
                 new_qty = old_qty + qty
-                new_price = ((old_price * old_qty) + (price * qty)) / new_qty
+                new_entry = (old_qty * old_entry + qty * price) / new_qty
+                if setup_tag and setup_tag not in old_tag:
+                    merged_tag = f"{old_tag},{setup_tag}".strip(",")
+                else:
+                    merged_tag = old_tag
                 await conn.execute(
-                    "UPDATE shadow_ledger SET quantity=?, entry_price=? WHERE id=?",
-                    (new_qty, new_price, row_id),
+                    "UPDATE shadow_ledger SET quantity=?, entry_price=?, setup_tag=? WHERE id=?",
+                    (new_qty, new_entry, merged_tag, same_day_row["id"]),
                 )
+                await conn.commit()
+                msg = (
+                    f"🎯 **前端火力捕获 (同日加仓)**\n"
+                    f"已接管来自 UI 的加仓指令：`{symbol}`\n"
+                    f"新增: {qty:.0f}股 @ ${price:.2f} (均价拉至 ${new_entry:.2f})\n"
+                    f"策略: {merged_tag or '未打标'}"
+                )
+                _spawn_background_task(_notify_user(msg))
             else:
                 tranche_id = f"T{len(open_tranches) + 1}"
                 await conn.execute(
                     "INSERT INTO shadow_ledger "
-                    "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status) "
-                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN')",
-                    (symbol, tranche_id, side, qty, price),
+                    "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
+                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                    (symbol, tranche_id, side, qty, price, setup_tag),
                 )
+                await conn.commit()
+                msg = (
+                    f"🎯 **前端火力捕获 (新开仓)**\n"
+                    f"已接管来自 UI 的开仓指令：`{symbol}`\n"
+                    f"成交: {qty:.0f}股 @ ${price:.2f}\n"
+                    f"策略: {setup_tag or '未打标'}\n"
+                    f"*(止损线将在 2 秒内自动同步防线)*"
+                )
+                _spawn_background_task(_notify_user(msg))
+                _spawn_background_task(_delayed_bracket_stop_capture(symbol))
         else:
             remaining_exit_qty = qty
             for row in open_tranches:
@@ -771,6 +969,8 @@ async def _async_on_execution(trade):
                     break
                 t_id = row["id"]
                 t_qty = float(row["quantity"])
+                t_entry = float(row["entry_price"])
+                tranche_side = row["side"]
                 if t_qty <= remaining_exit_qty:
                     cursor = await conn.execute(
                         "SELECT setup_tag FROM shadow_ledger WHERE id=?", (t_id,)
@@ -781,16 +981,138 @@ async def _async_on_execution(trade):
                         "UPDATE shadow_ledger SET status='CLOSED', exit_price=? WHERE id=?",
                         (price, t_id),
                     )
-                    asyncio.create_task(push_to_notion(t_id, symbol, 0.0, setup_tag))
+                    _spawn_background_task(push_to_notion(t_id, symbol, 0.0, setup_tag))
                     remaining_exit_qty -= t_qty
                 else:
-                    await conn.execute(
-                        "UPDATE shadow_ledger SET quantity=? WHERE id=?",
-                        (t_qty - remaining_exit_qty, t_id),
+                    new_qty = t_qty - remaining_exit_qty
+                    is_profitable_trim = (
+                        (tranche_side == "LONG" and price > t_entry)
+                        or (tranche_side == "SHORT" and price < t_entry)
                     )
+                    if is_profitable_trim:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET quantity=?, current_stop=? WHERE id=?",
+                            (new_qty, t_entry, t_id),
+                        )
+                        if tranche_side == "LONG":
+                            trim_detail = f"成交价: ${price:.2f} > 成本价: ${t_entry:.2f}"
+                        else:
+                            trim_detail = f"成交价: ${price:.2f} < 成本价: ${t_entry:.2f}"
+                        msg = (
+                            f"🤖 **自动护航：** 侦测到 `{symbol}` 盈利减仓！\n"
+                            f"{trim_detail}\n"
+                            f"系统已自动将剩余 {new_qty:.0f} 股止损推至成本价 ${t_entry:.2f}。\n"
+                            f"🛡️ **该笔交易风控额度已完全释放！**"
+                        )
+                        _spawn_background_task(_notify_user(msg))
+                    else:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET quantity=? WHERE id=?",
+                            (new_qty, t_id),
+                        )
                     remaining_exit_qty = 0
 
         await conn.commit()
+
+
+async def _delayed_bracket_stop_capture(symbol: str):
+    """延迟 2 秒主动扫描 TWS 未决止损单，修复 openOrder 先于成交的竞态。"""
+    await asyncio.sleep(2.0)
+    if not ib.isConnected():
+        return
+    try:
+        found_stop = None
+        for open_trade in ib.openTrades():
+            if (
+                open_trade.contract.symbol == symbol
+                and open_trade.order.orderType in ("STP", "STP LMT")
+            ):
+                found_stop = float(open_trade.order.auxPrice)
+                break
+        if not found_stop or found_stop <= 0:
+            return
+        async with connect_db() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE shadow_ledger
+                SET current_stop=?,
+                    initial_stop=?
+                WHERE symbol=? AND status='OPEN' AND initial_stop=0.0
+                """,
+                (found_stop, found_stop, symbol),
+            )
+            if cursor.rowcount > 0:
+                await conn.commit()
+                msg = (
+                    f"🛡️ **防线主动同步完毕：** `{symbol}` "
+                    f"的底层止损已被锚定在 ${found_stop:.2f}。"
+                )
+                await _notify_user(msg)
+    except Exception as e:
+        print(f"延迟捕获止损出错: {e}")
+
+
+def on_open_order(trade):
+    """拦截 TWS 未决订单变更（含图表拖拽修改止损）。"""
+    _dispatch_async(_async_on_open_order(trade))
+
+
+async def _async_on_open_order(trade):
+    try:
+        order = trade.order
+        contract = trade.contract
+        symbol = contract.symbol
+
+        if order.orderType not in ("STP", "STP LMT"):
+            return
+
+        new_stop = float(order.auxPrice)
+        if new_stop <= 0:
+            return
+
+        async with connect_db() as conn:
+            conn.row_factory = aiosqlite.Row
+            cursor = await conn.execute(
+                "SELECT id, current_stop, entry_price FROM shadow_ledger "
+                "WHERE symbol=? AND status='OPEN'",
+                (symbol,),
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return
+
+            old_stop = float(rows[0]["current_stop"])
+            entry_price = float(rows[0]["entry_price"])
+
+            if abs(new_stop - old_stop) <= 0.001:
+                return
+
+            await conn.execute(
+                """
+                UPDATE shadow_ledger
+                SET current_stop=?,
+                    initial_stop = CASE WHEN initial_stop = 0.0 THEN ? ELSE initial_stop END
+                WHERE symbol=? AND status='OPEN'
+                """,
+                (new_stop, new_stop, symbol),
+            )
+            await conn.commit()
+
+        if new_stop >= entry_price:
+            risk_status = "✅ 止损已推至成本区以上，零风险/锁定利润！"
+        else:
+            risk_pct = abs(entry_price - new_stop) / entry_price * 100
+            risk_status = f"📐 当前风险距离: {risk_pct:.2f}%"
+
+        msg = (
+            f"🖱️ **TWS 图表同步捕获：** `{symbol}`\n"
+            f"侦测到止损单修改：${old_stop:.2f} ➡️ **${new_stop:.2f}**\n"
+            f"影子账本已自动同步更新。\n"
+            f"{risk_status}"
+        )
+        await _notify_user(msg)
+    except Exception as e:
+        print(f"图表同步止损失败: {e}")
 
 
 async def heartbeat_2300(tg_application):
@@ -802,7 +1124,7 @@ async def heartbeat_2300(tg_application):
             target += datetime.timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
 
-        async with aiosqlite.connect(DB_PATH) as conn:
+        async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
             cursor = await conn.execute(
                 "SELECT symbol, side, quantity FROM shadow_ledger "
@@ -820,7 +1142,7 @@ async def heartbeat_2300(tg_application):
 
 
 async def get_10ema(symbol: str) -> float:
-    """利用 IBKR 原生历史数据计算昨日 10EMA。"""
+    """利用 IBKR 原生历史数据计算昨日 10EMA，避免盘中漂移。"""
     try:
         if not await ensure_ib_connected():
             return 0.0
@@ -842,6 +1164,8 @@ async def get_10ema(symbol: str) -> float:
 
         df = util.df(bars)
         df["10EMA"] = df["close"].ewm(span=10, adjust=False).mean()
+        if len(df) >= 2:
+            return float(df["10EMA"].iloc[-2])
         return float(df["10EMA"].iloc[-1])
     except Exception as e:
         print(f"获取 {symbol} 10EMA 失败: {e}")
@@ -851,8 +1175,9 @@ async def get_10ema(symbol: str) -> float:
 async def active_position_monitor(tg_application):
     """【3R 腾挪与 10EMA 追踪引擎】后台每 5 分钟巡检一次。"""
     await asyncio.sleep(15)
-    notified_3r: set[str] = set()
+    notified_3r: dict[str, float] = {}
     notified_ema: set[str] = set()
+    remind_3r_interval = 4 * 3600
 
     print("✅ 动态仓位巡检器 (Scale-out Financer) 已在后台启动...")
 
@@ -862,10 +1187,10 @@ async def active_position_monitor(tg_application):
                 await asyncio.sleep(60)
                 continue
 
-            async with aiosqlite.connect(DB_PATH) as conn:
+            async with connect_db() as conn:
                 conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
-                    "SELECT id, symbol, quantity, entry_price, initial_stop, current_stop "
+                    "SELECT id, symbol, side, quantity, entry_price, initial_stop, current_stop "
                     "FROM shadow_ledger WHERE status='OPEN'"
                 )
                 positions = await cursor.fetchall()
@@ -873,57 +1198,89 @@ async def active_position_monitor(tg_application):
             for pos in positions:
                 trade_id = pos["id"]
                 symbol = pos["symbol"]
+                side = pos["side"]
                 entry = float(pos["entry_price"])
                 initial_stop = float(pos["initial_stop"])
                 current_stop = float(pos["current_stop"])
-
-                one_r_risk = entry - initial_stop
-                if one_r_risk <= 0:
-                    continue
 
                 current_price, _ = await fetch_entry_price(symbol)
                 if not current_price or current_price <= 0:
                     continue
 
-                current_profit = current_price - entry
+                one_r_risk = abs(entry - initial_stop)
+                if one_r_risk <= 0:
+                    continue
+
+                if side == "LONG":
+                    current_profit = current_price - entry
+                else:
+                    current_profit = entry - current_price
                 current_r_multiple = current_profit / one_r_risk
 
-                # 规则 1：3R 强制减仓与平推止损提醒
-                if current_r_multiple >= 3.0 and current_stop < entry:
-                    cache_key = f"{trade_id}_3R"
-                    if cache_key not in notified_3r:
+                at_risk = (
+                    current_stop < entry if side == "LONG" else current_stop > entry
+                )
+                at_breakeven = (
+                    current_stop >= entry if side == "LONG" else current_stop <= entry
+                )
+
+                # 规则 1：3R 强制减仓与平推止损提醒（3R 区内每 4 小时重复督促）
+                cache_key_3r = f"{trade_id}_3R"
+                if current_r_multiple >= 3.0 and at_risk:
+                    now_ts = time.time()
+                    last_ts = notified_3r.get(cache_key_3r)
+                    if last_ts is None or (now_ts - last_ts) >= remind_3r_interval:
                         alert_msg = (
                             f"🚀 **【3R 爆发确认：严禁全仓死扛！】** `{symbol}`\n\n"
                             f"当前价格: ${current_price:.2f}\n"
                             f"当前浮盈: **+{current_r_multiple:.1f} R**\n\n"
-                            f"⚠️ **纪律指令 (两步走)：**\n"
+                            f"⚠️ **纪律指令：**\n"
                             f"1. 请立刻在 TWS **市价卖出 1/4 或 1/3**，用市场的钱为自己买下免费门票！\n"
-                            f"2. 卖出确认后，请立刻点击下方指令，将剩余仓位止损上移至成本价！\n\n"
-                            f"👉 `/update {symbol} {entry:.2f}`\n\n"
-                            f"*(注：只有平推止损后，该股票占用的风控额度才会被系统释放！让剩下的仓位去冲击 10R！)*"
+                            f"2. 成交后系统将**自动**把剩余仓位止损推至成本价，无需手动 `/update`。\n\n"
+                            f"*(注：平推完成后风控额度即时释放，尾仓可去冲击 10R！)*"
                         )
                         await tg_application.bot.send_message(
                             chat_id=MY_TELEGRAM_CHAT_ID, text=alert_msg
                         )
-                        notified_3r.add(cache_key)
+                        notified_3r[cache_key_3r] = now_ts
 
-                elif current_stop >= entry:
+                elif at_breakeven:
+                    notified_3r.pop(cache_key_3r, None)
                     ema_10 = await get_10ema(symbol)
-                    if ema_10 > 0 and current_price < (ema_10 * 0.99):
+                    ema_break = (
+                        current_price < (ema_10 * 0.99)
+                        if side == "LONG"
+                        else current_price > (ema_10 * 1.01)
+                    )
+                    if ema_10 > 0 and ema_break:
                         cache_key = f"{trade_id}_10EMA"
                         if cache_key not in notified_ema:
+                            t_qty = float(pos["quantity"])
+                            keyboard = [
+                                [
+                                    InlineKeyboardButton(
+                                        "🗡️ 授权系统市价全平 (斩立决)",
+                                        callback_data=f"KILL:{symbol}",
+                                    )
+                                ]
+                            ]
                             alert_msg = (
                                 f"🛑 **【尾仓趋势终结】** `{symbol}`\n\n"
                                 f"当前价格: ${current_price:.2f}\n"
                                 f"昨日 10EMA: ${ema_10:.2f}\n\n"
                                 f"⚠️ **纪律指令：**\n"
                                 f"价格已有效跌破 10EMA，动量已衰竭！\n"
-                                f"请立即手动清仓所有剩余的“免费彩票”，锁定波段利润！"
+                                f"请点击下方按钮，系统将自动撤销原止损单并市价清仓锁定利润！"
                             )
                             await tg_application.bot.send_message(
-                                chat_id=MY_TELEGRAM_CHAT_ID, text=alert_msg
+                                chat_id=MY_TELEGRAM_CHAT_ID,
+                                text=alert_msg,
+                                reply_markup=InlineKeyboardMarkup(keyboard),
                             )
                             notified_ema.add(cache_key)
+
+                else:
+                    notified_3r.pop(cache_key_3r, None)
 
         except Exception as e:
             print(f"后台巡检出错: {e}")
@@ -936,31 +1293,32 @@ async def ib_keepalive():
         if not ib.isConnected():
             await ensure_ib_connected()
             if ib.isConnected():
-                ib.execDetailsEvent += on_execution
+                if on_execution not in ib.execDetailsEvent:
+                    ib.execDetailsEvent += on_execution
+                if on_open_order not in ib.openOrderEvent:
+                    ib.openOrderEvent += on_open_order
         await asyncio.sleep(30)
 
 
-async def _startup_sequence() -> None:
+async def _post_init(app: Application) -> None:
+    bind_tg_bot(app.bot)
     await ensure_schema()
     await sync_flex_query()
-
-
-async def _post_init(app: Application) -> None:
     if await ensure_ib_connected():
-        ib.execDetailsEvent += on_execution
-        print("✅ TWS 已连接，异步成交监听已启动。")
+        if on_execution not in ib.execDetailsEvent:
+            ib.execDetailsEvent += on_execution
+        if on_open_order not in ib.openOrderEvent:
+            ib.openOrderEvent += on_open_order
+        print("✅ TWS 已连接，异步成交与止损同步监听已启动。")
         await reconcile_physical_positions(app)
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
-    asyncio.create_task(heartbeat_2300(app))
-    asyncio.create_task(ib_keepalive())
-    asyncio.create_task(active_position_monitor(app))
-    print("✅ Telegram Bot 已启动。")
+    _spawn_background_task(heartbeat_2300(app))
+    _spawn_background_task(ib_keepalive())
+    _spawn_background_task(active_position_monitor(app))
 
 
 def main() -> None:
-    asyncio.run(_startup_sequence())
-
     tg_app = (
         Application.builder()
         .token(TG_BOT_TOKEN)
@@ -978,7 +1336,17 @@ def main() -> None:
     tg_app.add_handler(CommandHandler("rename", cmd_rename))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
-    tg_app.run_polling(drop_pending_updates=True)
+    async def runner() -> None:
+        async with tg_app:
+            await tg_app.start()
+            print("✅ Telegram Bot 轮询已启动。")
+            await tg_app.updater.start_polling(drop_pending_updates=True)
+            await asyncio.Event().wait()
+
+    try:
+        asyncio.run(runner())
+    except KeyboardInterrupt:
+        print("风控军师已停止。")
 
 
 if __name__ == "__main__":

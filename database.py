@@ -1,12 +1,26 @@
 import datetime
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from config import DB_PATH
+from config import DB_PATH, DB_TIMEOUT, TRADING_TZ
+
+
+def connect_db():
+    """带锁等待超时的 SQLite 连接，降低并发写入时的 database is locked。"""
+    return aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
+
+
+def trading_now() -> datetime.datetime:
+    return datetime.datetime.now(ZoneInfo(TRADING_TZ))
+
+
+def trading_today_iso() -> str:
+    return trading_now().date().isoformat()
 
 
 async def ensure_schema() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with connect_db() as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS shadow_ledger (
@@ -55,7 +69,7 @@ async def ensure_schema() -> None:
 
 
 async def upsert_account_state(db_connection, equity: float, risk_light: str) -> None:
-    today = datetime.date.today().isoformat()
+    today = trading_today_iso()
     cursor = await db_connection.execute(
         "SELECT high_water_mark FROM account_state WHERE date=?", (today,)
     )
@@ -121,9 +135,16 @@ async def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price,
 
 
 async def get_today_trade_count(conn) -> int:
-    """获取今日已确认建仓的次数 (狙击手协议)"""
+    """获取今日已确认建仓的次数 (狙击手协议)，按 TRADING_TZ 日切。"""
+    tz = ZoneInfo(TRADING_TZ)
+    now = datetime.datetime.now(tz)
+    day_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
+    day_end = day_start + datetime.timedelta(days=1)
+    start_utc = day_start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_utc = day_end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     cur = await conn.execute(
-        "SELECT COUNT(*) FROM shadow_ledger WHERE date(create_time, 'localtime') = date('now', 'localtime')"
+        "SELECT COUNT(*) FROM shadow_ledger WHERE create_time >= ? AND create_time < ?",
+        (start_utc, end_utc),
     )
     row = await cur.fetchone()
     return int(row[0]) if row else 0
