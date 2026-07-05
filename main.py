@@ -472,9 +472,162 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/update [代码] [新止损价] — 移动止损\n"
         "/split [代码] [比例] — 拆/合股调整\n"
         "/rename [旧代码] [新代码] — 代码更名\n"
+        "/unlock [代码] [检讨≥15字] — 解锁桌面端 F9 越权下单\n"
         "/sync — 手动 Flex 对账"
     )
     await update.message.reply_text(text)
+
+
+@require_auth
+async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "⚠️ 格式错误。\n正确格式: /unlock [Ticker] [不少于15个字的检讨理由]"
+        )
+        return
+    symbol = args[0].upper()
+    confession = " ".join(args[1:]).strip()
+    if len(confession) < 15:
+        await update.message.reply_text(
+            f"❌ 检讨不够深刻：当前 {len(confession)} 字，至少需要 15 字。\n"
+            f"示例：/unlock TSLA 这是一个完美的VCP突破，严格止损在昨日低点下方"
+        )
+        return
+
+    try:
+        async with connect_db() as conn:
+            await conn.execute(
+                "INSERT OR REPLACE INTO auth_tokens (symbol, confession, expire_time) "
+                "VALUES (?, ?, datetime('now', '+5 minutes'))",
+                (symbol, confession),
+            )
+            await conn.commit()
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ 写入解锁令牌失败: {e}\n请先重启军师并运行 `python database_setup.py` 建表。"
+        )
+        return
+
+    await update.message.reply_text(
+        f"🔓 **授权已下发**\n"
+        f"[{symbol}] 的极速下单(F9)权限已解锁，有效期 5 分钟。\n"
+        f"理由：{confession}"
+    )
+
+
+async def morning_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [
+            InlineKeyboardButton("1 (失控)", callback_data="review_1"),
+            InlineKeyboardButton("2", callback_data="review_2"),
+            InlineKeyboardButton("3 (及格)", callback_data="review_3"),
+            InlineKeyboardButton("4", callback_data="review_4"),
+            InlineKeyboardButton("5 (完美)", callback_data="review_5"),
+        ]
+    ]
+    await context.bot.send_message(
+        chat_id=MY_TELEGRAM_CHAT_ID,
+        text=(
+            "🌅 **晨间审判 (Morning Review)**\n\n"
+            "请客观评估你**昨天**的纪律执行情况：\n"
+            "(如：是否无脑追高、是否执行了3R减仓、是否知行合一)"
+        ),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def reset_daily_status_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """盘前重置连亏计数，恢复当日交易额度感知。"""
+    async with connect_db() as conn:
+        await conn.execute(
+            "UPDATE system_state SET value='0' WHERE key='consecutive_losses'"
+        )
+        await conn.commit()
+    await context.bot.send_message(
+        chat_id=MY_TELEGRAM_CHAT_ID,
+        text=(
+            "🔄 **每日盘前重置**\n"
+            "系统连亏状态已归零，您的交易额度已恢复，今天也要坚守纪律！"
+        ),
+    )
+
+
+def _shanghai_day_utc_bounds(day_offset: int = 0) -> tuple[str, str, str]:
+    """返回 (date_iso, start_utc, end_utc)，按北京时间日历日切。"""
+    shanghai = ZoneInfo("Asia/Shanghai")
+    target_day = (
+        datetime.datetime.now(shanghai) - datetime.timedelta(days=day_offset)
+    ).date()
+    day_start = datetime.datetime.combine(
+        target_day, datetime.time.min, tzinfo=shanghai
+    )
+    day_end = day_start + datetime.timedelta(days=1)
+    start_utc = day_start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    end_utc = day_end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    return target_day.isoformat(), start_utc, end_utc
+
+
+async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    chat = query.message.chat if query.message else None
+    if chat is None or chat.id != MY_TELEGRAM_CHAT_ID:
+        await query.answer()
+        return
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("review_"):
+        return
+    score = int(data.split("_", 1)[1])
+    yesterday, start_utc, end_utc = _shanghai_day_utc_bounds(day_offset=1)
+    async with connect_db() as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            "INSERT OR REPLACE INTO daily_reviews (date, score, note) VALUES (?, ?, ?)",
+            (yesterday, score, ""),
+        )
+        cursor = await conn.execute(
+            """
+            SELECT s.symbol, s.setup_tag, s.realized_pnl, s.status, a.confession
+            FROM shadow_ledger s
+            LEFT JOIN auth_tokens a ON s.symbol = a.symbol
+            WHERE s.create_time >= ? AND s.create_time < ?
+            ORDER BY s.symbol, s.create_time
+            """,
+            (start_utc, end_utc),
+        )
+        rows = await cursor.fetchall()
+        await conn.commit()
+
+    lines = [
+        f"✅ 已记录昨日纪律得分：**{score} 分**。",
+        "",
+        "📝 **昨日复盘数据 (可直接导出 TradesViz)**:",
+    ]
+    if not rows:
+        lines.append("昨天是空仓，最伟大的纪律就是管住了手。")
+    else:
+        for row in rows:
+            pnl = float(row["realized_pnl"] or 0.0)
+            tag = row["setup_tag"] or "未知"
+            status = row["status"]
+            conf = (
+                f" | ⚠️ 违规理由: {row['confession']}"
+                if row["confession"]
+                else ""
+            )
+            if pnl > 0:
+                pnl_str = f"+${pnl:.2f}"
+            elif pnl < 0:
+                pnl_str = f"-${abs(pnl):.2f}"
+            else:
+                pnl_str = "$0.00"
+            lines.append(
+                f"- **{row['symbol']}** [{tag}] {status} 盈亏: {pnl_str}{conf}"
+            )
+    await query.edit_message_text(text="\n".join(lines))
 
 
 @require_auth
@@ -891,6 +1044,84 @@ def on_execution(trade):
     _dispatch_async(_async_on_execution(trade))
 
 
+async def _apply_consecutive_losses(conn, profitable: bool, losing: bool) -> None:
+    if profitable:
+        await conn.execute(
+            "UPDATE system_state SET value='0' WHERE key='consecutive_losses'"
+        )
+    elif losing:
+        cur = await conn.execute(
+            "SELECT value FROM system_state WHERE key='consecutive_losses'"
+        )
+        row = await cur.fetchone()
+        losses = int(row[0]) if row else 0
+        await conn.execute(
+            "UPDATE system_state SET value=? WHERE key='consecutive_losses'",
+            (str(losses + 1),),
+        )
+
+
+async def _night_watchman_on_tp(trade, execution) -> None:
+    """分批止盈成交后，将 TWS 止损单推移至保本价。"""
+    order = trade.order
+    if not order or order.orderType != "LMT":
+        return
+    is_long_tp = execution.side == "SLD"
+    is_short_tp = execution.side == "BOT"
+    if not is_long_tp and not is_short_tp:
+        return
+    if not await ensure_ib_connected():
+        return
+
+    symbol = trade.contract.symbol
+    try:
+        async with connect_db() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT side, entry_price FROM shadow_ledger "
+                "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
+                (symbol,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return
+            entry_price = float(row["entry_price"])
+            pos_side = row["side"]
+
+        for open_trade in ib.openTrades():
+            if open_trade.contract.symbol != symbol:
+                continue
+            if open_trade.order.orderType not in ("STP", "STP LMT"):
+                continue
+            stop_order = open_trade.order
+            old_stop = float(stop_order.auxPrice)
+            need_modify = False
+            if pos_side == "LONG" and old_stop < entry_price:
+                stop_order.auxPrice = entry_price
+                need_modify = True
+            elif pos_side == "SHORT" and old_stop > entry_price:
+                stop_order.auxPrice = entry_price
+                need_modify = True
+            if not need_modify:
+                continue
+            ib.placeOrder(open_trade.contract, stop_order)
+            async with connect_db() as conn:
+                await conn.execute(
+                    "UPDATE shadow_ledger SET current_stop=? WHERE symbol=? AND status='OPEN'",
+                    (entry_price, symbol),
+                )
+                await conn.commit()
+            await _notify_user(
+                f"🛡️ **守夜人协议触发**\n"
+                f"`{symbol}` 的分批止盈单已成交！\n"
+                f"后台已将剩余仓位的止损单推移至保本价 ${entry_price:.2f}。\n"
+                f"您可以安心睡觉了。"
+            )
+            break
+    except Exception as e:
+        print(f"守夜人保本钩子失败: {e}")
+
+
 async def _async_on_execution(trade):
     execution = trade.execution
     contract = trade.contract
@@ -966,6 +1197,8 @@ async def _async_on_execution(trade):
                 _spawn_background_task(_notify_user(msg))
                 _spawn_background_task(_delayed_bracket_stop_capture(symbol))
         else:
+            had_profit = False
+            had_loss = False
             remaining_exit_qty = qty
             for row in open_tranches:
                 if remaining_exit_qty <= 0:
@@ -980,6 +1213,14 @@ async def _async_on_execution(trade):
                     )
                     tag_row = await cursor.fetchone()
                     setup_tag = tag_row["setup_tag"] if tag_row and tag_row["setup_tag"] else ""
+                    if (tranche_side == "LONG" and price < t_entry) or (
+                        tranche_side == "SHORT" and price > t_entry
+                    ):
+                        had_loss = True
+                    elif (tranche_side == "LONG" and price > t_entry) or (
+                        tranche_side == "SHORT" and price < t_entry
+                    ):
+                        had_profit = True
                     await conn.execute(
                         "UPDATE shadow_ledger SET status='CLOSED', exit_price=? WHERE id=?",
                         (price, t_id),
@@ -993,6 +1234,7 @@ async def _async_on_execution(trade):
                         or (tranche_side == "SHORT" and price < t_entry)
                     )
                     if is_profitable_trim:
+                        had_profit = True
                         await conn.execute(
                             "UPDATE shadow_ledger SET quantity=?, current_stop=? WHERE id=?",
                             (new_qty, t_entry, t_id),
@@ -1009,13 +1251,22 @@ async def _async_on_execution(trade):
                         )
                         _spawn_background_task(_notify_user(msg))
                     else:
+                        if (tranche_side == "LONG" and price < t_entry) or (
+                            tranche_side == "SHORT" and price > t_entry
+                        ):
+                            had_loss = True
                         await conn.execute(
                             "UPDATE shadow_ledger SET quantity=? WHERE id=?",
                             (new_qty, t_id),
                         )
                     remaining_exit_qty = 0
 
+            await _apply_consecutive_losses(conn, had_profit, had_loss)
+
         await conn.commit()
+
+    if not opening:
+        _spawn_background_task(_night_watchman_on_tp(trade, execution))
 
 
 async def _delayed_bracket_stop_capture(symbol: str):
@@ -1314,6 +1565,19 @@ async def _post_init(app: Application) -> None:
         await reconcile_physical_positions(app)
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
+    if app.job_queue:
+        shanghai_tz = ZoneInfo("Asia/Shanghai")
+        app.job_queue.run_daily(
+            morning_review_job,
+            time=datetime.time(9, 0, tzinfo=shanghai_tz),
+            name="morning_review",
+        )
+        app.job_queue.run_daily(
+            reset_daily_status_job,
+            time=datetime.time(20, 0, tzinfo=shanghai_tz),
+            name="reset_daily_status",
+        )
+        print("✅ 定时任务已注册 (09:00 晨间审判 / 20:00 连亏重置)")
     _spawn_background_task(heartbeat_2300(app))
     _spawn_background_task(ib_keepalive())
     _spawn_background_task(active_position_monitor(app))
@@ -1335,6 +1599,8 @@ def main() -> None:
     tg_app.add_handler(CommandHandler("update", cmd_update))
     tg_app.add_handler(CommandHandler("split", cmd_split))
     tg_app.add_handler(CommandHandler("rename", cmd_rename))
+    tg_app.add_handler(CommandHandler("unlock", cmd_unlock))
+    tg_app.add_handler(CallbackQueryHandler(review_callback, pattern="^review_"))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
     async def runner() -> None:

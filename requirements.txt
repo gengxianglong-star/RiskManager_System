@@ -1,5 +1,6 @@
 ib_insync==0.9.86
-python-telegram-bot>=21.0
+python-telegram-bot[job-queue]>=21.0
+apscheduler>=3.10.0
 pandas>=2.2.0
 pandas_market_calendars>=5.0
 notion-client>=2.2.1
