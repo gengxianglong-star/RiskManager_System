@@ -53,6 +53,7 @@ from config import (
     RISK_MAX_DRAWDOWN_YELLOW,
     RISK_PCT_PER_TRADE,
     TG_BOT_TOKEN,
+    TRADING_TZ,
     TWS_HOST,
     TWS_PORT,
 )
@@ -63,7 +64,6 @@ from database import (
     insert_shadow_ledger,
     load_pending_intent,
     save_pending_intent,
-    trading_now,
     upsert_account_state,
     get_today_trade_count,
 )
@@ -664,7 +664,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             action = "SELL" if actual_qty > 0 else "BUY"
             mkt_order = MarketOrder(action, abs(actual_qty))
-            await ib.placeOrderAsync(contract, mkt_order)
+            ib.placeOrder(contract, mkt_order)
 
             await query.edit_message_text(
                 text=(
@@ -914,11 +914,16 @@ async def _async_on_execution(trade):
         opening = not open_tranches or open_tranches[0]["side"] == side
 
         if opening:
-            today_str = trading_now().strftime("%Y%m%d")
+            tz = ZoneInfo(TRADING_TZ)
+            now = datetime.datetime.now(tz)
+            day_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
+            day_end = day_start + datetime.timedelta(days=1)
+            start_utc = day_start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            end_utc = day_end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             cursor = await conn.execute(
                 "SELECT id, quantity, entry_price, setup_tag FROM shadow_ledger "
-                "WHERE symbol=? AND side=? AND status='OPEN' AND strftime('%Y%m%d', create_time)=?",
-                (symbol, side, today_str),
+                "WHERE symbol=? AND side=? AND status='OPEN' AND create_time >= ? AND create_time < ?",
+                (symbol, side, start_utc, end_utc),
             )
             same_day_row = await cursor.fetchone()
 
