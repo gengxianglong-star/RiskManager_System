@@ -413,6 +413,55 @@ async def reconcile_physical_positions(tg_application):
             print("✅ 物理仓位与影子账本 100% 吻合，防线坚固。")
 
 
+async def execute_kill_switch(symbol: str, trigger_reason: str = "手动授权") -> str:
+    """核心斩立决逻辑，支持 Telegram 手动与 10EMA 自动触发。"""
+    if not await ensure_ib_connected():
+        return "❌ TWS 未连接，清仓失败。请手动在 TWS 操作！"
+
+    try:
+        contract = Stock(symbol, "SMART", "USD")
+        qualified = await ib.qualifyContractsAsync(contract)
+        if not qualified:
+            return f"❌ 无法验证合约 `{symbol}`。"
+
+        positions = await ib.reqPositionsAsync()
+        actual_qty = 0.0
+        for pos in positions:
+            if (
+                pos.contract.secType == "STK"
+                and pos.contract.symbol == symbol
+                and pos.position != 0
+            ):
+                actual_qty = float(pos.position)
+                break
+
+        if actual_qty == 0:
+            return f"ℹ️ {symbol} TWS 实盘持仓已为 0，跳过斩立决。"
+
+        canceled_count = 0
+        for trade in ib.trades():
+            if trade.contract.symbol == symbol and not trade.isDone():
+                await ib.cancelOrderAsync(trade.order)
+                canceled_count += 1
+
+        if canceled_count > 0:
+            await asyncio.sleep(1.5)
+
+        action = "SELL" if actual_qty > 0 else "BUY"
+        mkt_order = MarketOrder(action, abs(actual_qty))
+        ib.placeOrder(contract, mkt_order)
+
+        return (
+            f"💀 **斩立决已成功执行 [{symbol}]**\n"
+            f"触发原因: {trigger_reason}\n"
+            f"已撤销 {canceled_count} 笔保护挂单\n"
+            f"发送市价单: {action} {abs(actual_qty):.0f} 股。\n"
+            f"*(系统将通过异步成交回报自动冲销账本)*"
+        )
+    except Exception as e:
+        return f"❌ 斩立决发生异常: {e}"
+
+
 @require_auth
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -622,60 +671,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("KILL:"):
         symbol = data.split(":", 1)[1].upper()
-
         await query.edit_message_text(text=f"⏳ 正在执行安全锁清仓，请稍候 [{symbol}]...")
-
-        if not await ensure_ib_connected():
-            await query.edit_message_text(text="❌ TWS 未连接，清仓失败。请手动在 TWS 操作！")
-            return
-
-        try:
-            contract = Stock(symbol, "SMART", "USD")
-            qualified = await ib.qualifyContractsAsync(contract)
-            if not qualified:
-                await query.edit_message_text(text=f"❌ 无法验证合约 `{symbol}`。")
-                return
-
-            positions = await ib.reqPositionsAsync()
-            actual_qty = 0.0
-            for pos in positions:
-                if (
-                    pos.contract.secType == "STK"
-                    and pos.contract.symbol == symbol
-                    and pos.position != 0
-                ):
-                    actual_qty = float(pos.position)
-                    break
-
-            if actual_qty == 0:
-                await query.edit_message_text(
-                    text=f"ℹ️ {symbol} TWS 实盘持仓已为 0，跳过斩立决。"
-                )
-                return
-
-            canceled_count = 0
-            for trade in ib.trades():
-                if trade.contract.symbol == symbol and not trade.isDone():
-                    await ib.cancelOrderAsync(trade.order)
-                    canceled_count += 1
-
-            if canceled_count > 0:
-                await asyncio.sleep(1.5)
-
-            action = "SELL" if actual_qty > 0 else "BUY"
-            mkt_order = MarketOrder(action, abs(actual_qty))
-            ib.placeOrder(contract, mkt_order)
-
-            await query.edit_message_text(
-                text=(
-                    f"💀 **斩立决已成功执行 [{symbol}]**\n"
-                    f"已撤销 {canceled_count} 笔保护挂单\n"
-                    f"发送市价单: {action} {abs(actual_qty):.0f} 股。\n"
-                    f"*(系统将通过异步成交回报自动冲销账本)*"
-                )
-            )
-        except Exception as e:
-            await query.edit_message_text(text=f"❌ 斩立决发生异常: {e}")
+        result_msg = await execute_kill_switch(symbol, trigger_reason="Telegram按钮手动授权")
+        await query.edit_message_text(text=result_msg)
         return
 
     if data.startswith("CONFIRM:"):
@@ -1260,29 +1258,25 @@ async def active_position_monitor(tg_application):
                     if ema_10 > 0 and ema_break:
                         cache_key = f"{trade_id}_10EMA"
                         if cache_key not in notified_ema:
-                            t_qty = float(pos["quantity"])
-                            keyboard = [
-                                [
-                                    InlineKeyboardButton(
-                                        "🗡️ 授权系统市价全平 (斩立决)",
-                                        callback_data=f"KILL:{symbol}",
-                                    )
-                                ]
-                            ]
+                            notified_ema.add(cache_key)
                             alert_msg = (
-                                f"🛑 **【尾仓趋势终结】** `{symbol}`\n\n"
+                                f"🛑 **【尾仓趋势终结 - 机器代管介入】** `{symbol}`\n\n"
                                 f"当前价格: ${current_price:.2f}\n"
                                 f"昨日 10EMA: ${ema_10:.2f}\n\n"
-                                f"⚠️ **纪律指令：**\n"
-                                f"价格已有效跌破 10EMA，动量已衰竭！\n"
-                                f"请点击下方按钮，系统将自动撤销原止损单并市价清仓锁定利润！"
+                                f"⚠️ 价格已有效跌破 10EMA，动量已衰竭！\n"
+                                f"🤖 **系统判定为危险，正在自动执行斩立决程序...**"
                             )
                             await tg_application.bot.send_message(
                                 chat_id=MY_TELEGRAM_CHAT_ID,
                                 text=alert_msg,
-                                reply_markup=InlineKeyboardMarkup(keyboard),
                             )
-                            notified_ema.add(cache_key)
+                            kill_result = await execute_kill_switch(
+                                symbol, trigger_reason="10EMA跌破机器自动熔断"
+                            )
+                            await tg_application.bot.send_message(
+                                chat_id=MY_TELEGRAM_CHAT_ID,
+                                text=kill_result,
+                            )
 
                 else:
                     notified_3r.pop(cache_key_3r, None)
@@ -1298,6 +1292,7 @@ async def ib_keepalive():
         if not ib.isConnected():
             await ensure_ib_connected()
             if ib.isConnected():
+                ib.reqAutoOpenOrders(True)
                 if on_execution not in ib.execDetailsEvent:
                     ib.execDetailsEvent += on_execution
                 if on_open_order not in ib.openOrderEvent:
@@ -1310,11 +1305,12 @@ async def _post_init(app: Application) -> None:
     await ensure_schema()
     await sync_flex_query()
     if await ensure_ib_connected():
+        ib.reqAutoOpenOrders(True)
         if on_execution not in ib.execDetailsEvent:
             ib.execDetailsEvent += on_execution
         if on_open_order not in ib.openOrderEvent:
             ib.openOrderEvent += on_open_order
-        print("✅ TWS 已连接，异步成交与止损同步监听已启动。")
+        print("✅ TWS 已连接，主客户端(Master Client)全局跨端监听已启动。")
         await reconcile_physical_positions(app)
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
