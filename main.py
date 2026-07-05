@@ -19,7 +19,9 @@ except RuntimeError:
 
 import aiosqlite
 import nest_asyncio
+import pandas as pd
 import pandas_market_calendars as mcal
+import yfinance as yf
 from ib_insync import IB, FlexReport, MarketOrder, Stock, util
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
@@ -113,6 +115,90 @@ async def ensure_ib_connected() -> bool:
     except Exception as e:
         print(f"TWS 未连接: {e}")
         return False
+
+
+async def check_corporate_actions(tg_app_or_context=None) -> None:
+    """盘前巡检：yfinance 检测拆股并自动折算账本，无法报价则预警更名/退市。"""
+    async with connect_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT DISTINCT symbol FROM shadow_ledger WHERE status='OPEN'"
+        )
+        rows = await cursor.fetchall()
+    symbols = [r["symbol"] for r in rows]
+    if not symbols:
+        return
+
+    loop = asyncio.get_running_loop()
+
+    async def _notify(text: str) -> None:
+        if tg_app_or_context is not None and hasattr(tg_app_or_context, "bot"):
+            await tg_app_or_context.bot.send_message(
+                chat_id=MY_TELEGRAM_CHAT_ID, text=text
+            )
+        else:
+            await _notify_user(text)
+
+    for sym in symbols:
+        try:
+
+            def fetch_data(ticker_str: str):
+                tkr = yf.Ticker(ticker_str)
+                splits = tkr.splits
+                try:
+                    last_price = tkr.fast_info["lastPrice"]
+                except Exception:
+                    last_price = None
+                return splits, last_price
+
+            splits, last_price = await loop.run_in_executor(None, fetch_data, sym)
+
+            if splits is not None and not splits.empty:
+                for split_date, ratio in splits.tail(3).items():
+                    ratio_f = float(ratio)
+                    if ratio_f <= 0 or ratio_f == 1.0:
+                        continue
+                    date_str = split_date.strftime("%Y-%m-%d")
+                    async with connect_db() as db:
+                        cur = await db.execute(
+                            "SELECT 1 FROM applied_splits WHERE symbol=? AND split_date=?",
+                            (sym, date_str),
+                        )
+                        if await cur.fetchone():
+                            continue
+                        await db.execute(
+                            """
+                            UPDATE shadow_ledger
+                            SET quantity=quantity*?,
+                                entry_price=entry_price/?,
+                                initial_stop=initial_stop/?,
+                                current_stop=current_stop/?
+                            WHERE symbol=? AND status='OPEN'
+                            """,
+                            (ratio_f, ratio_f, ratio_f, ratio_f, sym),
+                        )
+                        await db.execute(
+                            "INSERT INTO applied_splits (symbol, split_date, ratio) "
+                            "VALUES (?, ?, ?)",
+                            (sym, date_str, ratio_f),
+                        )
+                        await db.commit()
+                    await _notify(
+                        f"✂️ **自动化拆股执行**\n"
+                        f"系统检测到 `{sym}` 在 {date_str} 执行了 1:{ratio_f:g} 拆股。\n"
+                        f"影子账本已静默自动等比例折算，风控防线已调整！"
+                    )
+
+            if last_price is None or pd.isna(last_price):
+                await _notify(
+                    f"⚠️ **公司代码异常预警**\n"
+                    f"系统无法从雅虎财经获取 `{sym}` 的最新行情数据。\n"
+                    f"该股票可能已**更名、被收购或退市**。\n"
+                    f"请在 TWS 核实后，使用 `/rename {sym} [新代码]` 手动修正账本！"
+                )
+        except Exception as e:
+            print(f"巡检 {sym} 公司行动异常: {e}")
+        await asyncio.sleep(0.5)
 
 
 async def fetch_entry_price(symbol: str):
@@ -256,10 +342,9 @@ def _flex_trade_attr(trade, *names, default=""):
     return default
 
 
-async def sync_flex_query():
-    print("⏳ 开始执行盘前静默对账协议...")
+async def sync_flex_query(tg_app_or_context=None):
+    """完全静默的 Flex 对账：无平仓则不通知。"""
     if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
-        print("💤 未配置 Flex Token，跳过对账。")
         return
 
     nyse = mcal.get_calendar("NYSE")
@@ -269,12 +354,9 @@ async def sync_flex_query():
         end_date=today,
     )
     if len(valid_days) < 2:
-        print("💤 交易日历不足，跳过 Flex 对账。")
         return
-
     last_trading_day = valid_days[-2].date()
     if today.date() - last_trading_day > datetime.timedelta(days=1):
-        print("💤 上个日历日非交易日，跳过 Flex 对账。")
         return
 
     try:
@@ -285,11 +367,15 @@ async def sync_flex_query():
         async with connect_db() as db_connection:
             db_connection.row_factory = aiosqlite.Row
             closed = 0
+            total_pnl = 0.0
+            closed_symbols: list[str] = []
             for trade in report.extract("Trade"):
                 symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
                 if not symbol:
                     continue
-                exec_price = float(_flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0)
+                exec_price = float(
+                    _flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0
+                )
                 realized_pnl = float(
                     _flex_trade_attr(
                         trade,
@@ -301,9 +387,9 @@ async def sync_flex_query():
                     )
                     or 0
                 )
-
                 cursor = await db_connection.execute(
-                    "SELECT id, setup_tag FROM shadow_ledger WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
+                    "SELECT id, setup_tag FROM shadow_ledger "
+                    "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
                     (symbol,),
                 )
                 row = await cursor.fetchone()
@@ -314,12 +400,32 @@ async def sync_flex_query():
                         "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
                         (exec_price, realized_pnl, trade_id),
                     )
-                    _spawn_background_task(push_to_notion(trade_id, symbol, realized_pnl, setup_tag))
+                    _spawn_background_task(
+                        push_to_notion(trade_id, symbol, realized_pnl, setup_tag)
+                    )
                     closed += 1
+                    total_pnl += realized_pnl
+                    closed_symbols.append(symbol)
             await db_connection.commit()
-            print(f"✅ Flex 对账完成，关闭 {closed} 条影子仓位。")
+
+        if closed > 0:
+            pnl_str = (
+                f"+${total_pnl:.2f}" if total_pnl > 0 else f"-${abs(total_pnl):.2f}"
+            )
+            msg = (
+                f"✅ **盘前静默清算完成**\n"
+                f"成功对账并关闭 {closed} 笔仓位：{', '.join(closed_symbols)}\n"
+                f"合计盈亏: {pnl_str}\n"
+                f"数据已自动归档至复盘库。"
+            )
+            if tg_app_or_context is not None and hasattr(tg_app_or_context, "bot"):
+                await tg_app_or_context.bot.send_message(
+                    chat_id=MY_TELEGRAM_CHAT_ID, text=msg
+                )
+            else:
+                await _notify_user(msg)
     except Exception as e:
-        print(f"❌ Flex 账单拉取失败: {e}")
+        print(f"Flex 对账失败: {e}")
 
 
 async def reconcile_physical_positions(tg_application):
@@ -665,8 +771,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await sync_flex_query()
-    await update.message.reply_text("✅ Flex 对账任务已执行，详见控制台日志。")
+    await sync_flex_query(context)
+    await update.message.reply_text("✅ 静默对账已触发，若有平仓将单独推送捷报。")
 
 
 @require_auth
@@ -1551,10 +1657,17 @@ async def ib_keepalive():
         await asyncio.sleep(30)
 
 
+async def automated_pre_market_routine(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """20:30 后台静默 Flex 对账 + 公司行动巡检（不关机的双重保障）。"""
+    await sync_flex_query(context)
+    await check_corporate_actions(context)
+
+
 async def _post_init(app: Application) -> None:
     bind_tg_bot(app.bot)
     await ensure_schema()
-    await sync_flex_query()
+    _spawn_background_task(sync_flex_query(app))
+    _spawn_background_task(check_corporate_actions(app))
     if await ensure_ib_connected():
         ib.reqAutoOpenOrders(True)
         if on_execution not in ib.execDetailsEvent:
@@ -1577,7 +1690,12 @@ async def _post_init(app: Application) -> None:
             time=datetime.time(20, 0, tzinfo=shanghai_tz),
             name="reset_daily_status",
         )
-        print("✅ 定时任务已注册 (09:00 晨间审判 / 20:00 连亏重置)")
+        app.job_queue.run_daily(
+            automated_pre_market_routine,
+            time=datetime.time(20, 30, tzinfo=shanghai_tz),
+            name="pre_market_routine",
+        )
+        print("✅ 定时任务已注册 (09:00 晨间审判 / 20:00 连亏重置 / 20:30 静默对账巡检)")
     _spawn_background_task(heartbeat_2300(app))
     _spawn_background_task(ib_keepalive())
     _spawn_background_task(active_position_monitor(app))

@@ -94,6 +94,16 @@ async def ensure_schema() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applied_splits (
+                symbol TEXT,
+                split_date TEXT,
+                ratio REAL,
+                PRIMARY KEY (symbol, split_date)
+            )
+            """
+        )
         await db.commit()
 
 
