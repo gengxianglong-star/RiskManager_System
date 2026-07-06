@@ -27,6 +27,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 ib = IB()
+_active_tws_port: int | None = None
 _background_tasks: set[asyncio.Task] = set()
 _tg_bot: Bot | None = None
 _ib_loop_patched = False
@@ -58,7 +59,7 @@ from config import (
     TG_BOT_TOKEN,
     TRADING_TZ,
     TWS_HOST,
-    TWS_PORT,
+    resolve_tws_ports,
 )
 from database import (
     connect_db,
@@ -100,6 +101,11 @@ def require_auth(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         if chat is None or chat.id != MY_TELEGRAM_CHAT_ID:
+            if chat is not None:
+                print(
+                    f"⚠️ 忽略未授权 Telegram 消息 chat_id={chat.id} "
+                    f"(期望 {MY_TELEGRAM_CHAT_ID})"
+                )
             return
         return await func(update, context)
 
@@ -107,15 +113,26 @@ def require_auth(func):
 
 
 async def ensure_ib_connected() -> bool:
+    global _active_tws_port
     if ib.isConnected():
         return True
     _patch_ib_asyncio_once()
-    try:
-        await ib.connectAsync(TWS_HOST, TWS_PORT, clientId=CLIENT_ID, timeout=5)
-        return True
-    except Exception as e:
-        print(f"TWS 未连接: {e}")
-        return False
+    preferred, fallback, mode_cn = resolve_tws_ports()
+    for port in (preferred, fallback):
+        try:
+            await ib.connectAsync(TWS_HOST, port, clientId=CLIENT_ID, timeout=5)
+            _active_tws_port = port
+            used_fallback = port != preferred
+            suffix = " (备用端口)" if used_fallback else ""
+            print(
+                f"✅ TWS 已连接：{mode_cn} {TWS_HOST}:{port}{suffix} "
+                f"(clientId={CLIENT_ID})"
+            )
+            return True
+        except Exception as e:
+            print(f"TWS {TWS_HOST}:{port} 连接失败: {e}")
+    _active_tws_port = None
+    return False
 
 
 async def check_corporate_actions(tg_app_or_context=None) -> None:
@@ -432,6 +449,50 @@ async def sync_flex_query(tg_app_or_context=None):
         print(f"Flex 对账失败: {e}")
 
 
+def _signed_ledger_qty(side: str, quantity: float) -> float:
+    return quantity if str(side).upper() == "LONG" else -quantity
+
+
+def _fmt_signed_position(qty: float) -> str:
+    if abs(qty) < 1e-6:
+        return "0 股"
+    direction = "多" if qty > 0 else "空"
+    return f"{abs(qty):.0f} 股 {direction}"
+
+
+async def _close_ledger_discrepancy(
+    conn: aiosqlite.Connection, symbol: str, discrepancy: float
+) -> None:
+    """按 FIFO 削减账本仓位；discrepancy = 账本 signed - TWS signed。"""
+    if abs(discrepancy) < 1e-6:
+        return
+    side_to_close = "LONG" if discrepancy > 0 else "SHORT"
+    remaining = abs(discrepancy)
+    cursor = await conn.execute(
+        "SELECT id, quantity FROM shadow_ledger "
+        "WHERE symbol=? AND status='OPEN' AND side=? ORDER BY create_time ASC",
+        (symbol, side_to_close),
+    )
+    open_tranches = await cursor.fetchall()
+    for tranche in open_tranches:
+        if remaining <= 0:
+            break
+        t_id = tranche["id"]
+        t_qty = float(tranche["quantity"])
+        if t_qty <= remaining + 1e-6:
+            await conn.execute(
+                "UPDATE shadow_ledger SET status='CLOSED', exit_price=0, realized_pnl=0 WHERE id=?",
+                (t_id,),
+            )
+            remaining -= t_qty
+        else:
+            await conn.execute(
+                "UPDATE shadow_ledger SET quantity=? WHERE id=?",
+                (t_qty - remaining, t_id),
+            )
+            remaining = 0
+
+
 async def reconcile_physical_positions(tg_application):
     print("🔍 启动物理仓位深度对账...")
     if not ib.isConnected():
@@ -444,7 +505,7 @@ async def reconcile_physical_positions(tg_application):
         print(f"❌ 物理持仓拉取失败: {e}")
         return
 
-    physical_inventory = {}
+    physical_inventory: dict[str, float] = {}
     for pos in positions:
         if pos.contract.secType == "STK" and pos.position != 0:
             physical_inventory[pos.contract.symbol] = float(pos.position)
@@ -453,60 +514,46 @@ async def reconcile_physical_positions(tg_application):
         conn.row_factory = aiosqlite.Row
 
         cursor = await conn.execute(
-            "SELECT symbol, quantity FROM shadow_ledger WHERE status='OPEN'"
+            "SELECT symbol, quantity, side FROM shadow_ledger WHERE status='OPEN'"
         )
         ledger_positions = await cursor.fetchall()
 
-        expected_inventory = {}
+        expected_inventory: dict[str, float] = {}
         for row in ledger_positions:
             sym = row["symbol"]
-            expected_inventory[sym] = expected_inventory.get(sym, 0.0) + float(row["quantity"])
+            signed = _signed_ledger_qty(row["side"], float(row["quantity"]))
+            expected_inventory[sym] = expected_inventory.get(sym, 0.0) + signed
 
-        ghost_alerts = []
+        ghost_alerts: list[str] = []
+        all_symbols = set(physical_inventory) | set(expected_inventory)
 
-        for sym, expected_qty in expected_inventory.items():
-            actual_qty = physical_inventory.get(sym, 0.0)
-            if actual_qty < expected_qty:
-                discrepancy = expected_qty - actual_qty
+        for sym in sorted(all_symbols):
+            actual = physical_inventory.get(sym, 0.0)
+            expected = expected_inventory.get(sym, 0.0)
+            if abs(actual - expected) < 1e-6:
+                continue
+
+            discrepancy = expected - actual
+            same_direction = actual == 0 or expected == 0 or actual * expected > 0
+            ledger_overstates = (
+                expected != 0
+                and same_direction
+                and abs(expected) > abs(actual) + 1e-6
+            )
+
+            if ledger_overstates:
                 ghost_alerts.append(
                     f"👻 **发现幽灵平仓 [{sym}]**\n"
-                    f"账本预期: {expected_qty} 股 | TWS实际: {actual_qty} 股\n"
+                    f"账本预期: {_fmt_signed_position(expected)} | "
+                    f"TWS实际: {_fmt_signed_position(actual)}\n"
                     f"*(系统已强制启动 FIFO 清剿修复)*"
                 )
-
-                cursor = await conn.execute(
-                    "SELECT id, quantity, setup_tag FROM shadow_ledger "
-                    "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
-                    (sym,),
-                )
-                open_tranches = await cursor.fetchall()
-                remaining_to_close = discrepancy
-
-                for tranche in open_tranches:
-                    if remaining_to_close <= 0:
-                        break
-                    t_id = tranche["id"]
-                    t_qty = float(tranche["quantity"])
-
-                    if t_qty <= remaining_to_close:
-                        await conn.execute(
-                            "UPDATE shadow_ledger SET status='CLOSED', exit_price=0, realized_pnl=0 WHERE id=?",
-                            (t_id,),
-                        )
-                        remaining_to_close -= t_qty
-                    else:
-                        await conn.execute(
-                            "UPDATE shadow_ledger SET quantity=? WHERE id=?",
-                            (t_qty - remaining_to_close, t_id),
-                        )
-                        remaining_to_close = 0
-
-        for sym, actual_qty in physical_inventory.items():
-            expected_qty = expected_inventory.get(sym, 0.0)
-            if actual_qty > expected_qty:
+                await _close_ledger_discrepancy(conn, sym, discrepancy)
+            else:
                 ghost_alerts.append(
                     f"⚠️ **发现未授权物理仓位 [{sym}]**\n"
-                    f"账本预期: {expected_qty} 股 | TWS实际: {actual_qty} 股\n"
+                    f"账本预期: {_fmt_signed_position(expected)} | "
+                    f"TWS实际: {_fmt_signed_position(actual)}\n"
                     f"*(请立刻使用 /init 或 /override 录入系统！)*"
                 )
 
@@ -868,6 +915,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"stop={r['current_stop']:.2f} [{r['setup_tag']}]"
                 )
         await update.message.reply_text("\n".join(lines))
+
+
+@require_auth
+async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_ib_connected():
+        await update.message.reply_text("❌ TWS 未连接，无法对账。请确认桌面端账户模式与 TWS 已登录。")
+        return
+    await reconcile_physical_positions(context.application)
+    await update.message.reply_text("✅ 物理对账已完成，若有差异已推送警报。")
 
 
 @require_auth
@@ -1736,7 +1792,15 @@ async def active_position_monitor(tg_application):
 
 
 async def ib_keepalive():
+    global _active_tws_port
     while True:
+        preferred, _, mode_cn = resolve_tws_ports()
+        if ib.isConnected() and _active_tws_port is not None and _active_tws_port != preferred:
+            print(
+                f"检测到桌面端切换为{mode_cn}，重连 TWS {TWS_HOST}:{preferred}…"
+            )
+            ib.disconnect()
+            _active_tws_port = None
         if not ib.isConnected():
             await ensure_ib_connected()
             if ib.isConnected():
@@ -1780,6 +1844,7 @@ def main() -> None:
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("init", cmd_init))
     tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("reconcile", cmd_reconcile))
     tg_app.add_handler(CommandHandler("sync", cmd_sync))
     tg_app.add_handler(CommandHandler("override", cmd_override))
     tg_app.add_handler(CommandHandler("update", cmd_update))

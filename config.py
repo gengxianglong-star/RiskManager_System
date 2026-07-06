@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,11 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 MY_TELEGRAM_CHAT_ID = int(os.getenv("MY_TELEGRAM_CHAT_ID", "123456789"))
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TG_TOKEN")
 TWS_HOST = os.getenv("TWS_HOST", "127.0.0.1")
+# 兼容旧配置；优先跟随桌面端 ~/.ibkr-order-tool/settings.json
 TWS_PORT = int(os.getenv("TWS_PORT", "7497"))
+DEFAULT_PAPER_PORT = int(os.getenv("PAPER_PORT", "7497"))
+DEFAULT_LIVE_PORT = int(os.getenv("LIVE_PORT", "7496"))
+DESKTOP_SETTINGS_PATH = Path.home() / ".ibkr-order-tool" / "settings.json"
 CLIENT_ID = 0  # Master Client，必须为 0 才能跨端监听桌面端/手机订单
 FLEX_TOKEN = os.getenv("FLEX_TOKEN", "YOUR_FLEX_TOKEN")
 FLEX_QUERY_ID = os.getenv("FLEX_QUERY_ID", "YOUR_FLEX_QUERY_ID")
@@ -43,3 +48,29 @@ ENABLE_EOD_SNIPER = os.getenv("ENABLE_EOD_SNIPER", "false").lower() in (
     "true",
     "yes",
 )
+
+
+def resolve_tws_ports() -> tuple[int, int, str]:
+    """跟随桌面端账户模式，返回 (首选端口, 备用端口, 模式中文)。"""
+    paper_port = DEFAULT_PAPER_PORT
+    live_port = DEFAULT_LIVE_PORT
+    account_mode = "paper"
+
+    if DESKTOP_SETTINGS_PATH.exists():
+        try:
+            data = json.loads(DESKTOP_SETTINGS_PATH.read_text(encoding="utf-8"))
+            paper_port = int(data.get("paper_port", paper_port))
+            live_port = int(data.get("live_port", live_port))
+            account_mode = str(data.get("account_mode", account_mode)).lower()
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            print(f"⚠️ 读取桌面端 settings.json 失败，使用默认端口: {exc}")
+    else:
+        # 无桌面配置时，用 .env 的 TWS_PORT 推断模式
+        if TWS_PORT == live_port:
+            account_mode = "live"
+        elif TWS_PORT == paper_port:
+            account_mode = "paper"
+
+    if account_mode == "live":
+        return live_port, paper_port, "实盘"
+    return paper_port, live_port, "模拟"
