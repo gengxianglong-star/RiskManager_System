@@ -63,6 +63,7 @@ from config import (
 )
 from database import (
     connect_db,
+    count_open_tranches,
     delete_pending_intent,
     ensure_schema,
     insert_shadow_ledger,
@@ -701,6 +702,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/split [代码] [比例] — 拆/合股调整\n"
         "/rename [旧代码] [新代码] — 代码更名\n"
         "/unlock [代码] [检讨≥15字] — 解锁桌面端 F9 越权下单\n"
+        "/import — 收编 TWS 历史持仓进影子账本\n"
+        "/reconcile — 物理仓位对账\n"
         "/sync — 手动 Flex 对账"
     )
     await update.message.reply_text(text)
@@ -893,7 +896,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await upsert_account_state(conn, equity, risk_light)
 
         cur = await conn.execute(
-            "SELECT symbol, tranche_id, quantity, entry_price, current_stop, setup_tag "
+            "SELECT symbol, tranche_id, side, quantity, entry_price, current_stop, initial_stop, setup_tag "
             "FROM shadow_ledger WHERE status='OPEN' ORDER BY symbol, create_time"
         )
         rows = await cur.fetchall()
@@ -906,15 +909,76 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         if not rows:
             lines.append("📭 当前无 OPEN 影子仓位。")
+            lines.append("*(提示: 模拟盘老仓请先发 /import 收编)*")
         else:
             lines.append("📒 影子账本 OPEN:")
             for r in rows:
+                stop = float(r["current_stop"])
+                initial = float(r["initial_stop"])
+                naked = stop == 0.0 and initial == 0.0
+                warn = " ⚠️ [危险: 无止损(裸奔)]" if naked else ""
                 lines.append(
-                    f"  • {r['symbol']} {r['tranche_id']} "
-                    f"qty={r['quantity']:.0f} @ {r['entry_price']:.2f} "
-                    f"stop={r['current_stop']:.2f} [{r['setup_tag']}]"
+                    f"  • {r['side']} {r['symbol']} {r['tranche_id']} "
+                    f"{r['quantity']:.0f}股 @ {r['entry_price']:.2f} "
+                    f"stop {stop:.2f} [{r['setup_tag'] or '未打标'}]{warn}"
                 )
         await update.message.reply_text("\n".join(lines))
+
+
+@require_auth
+async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """将 TWS 物理持仓强制收编进影子账本（模拟盘初始化 / 接管历史仓位）。"""
+    if not await ensure_ib_connected():
+        await update.message.reply_text("❌ 无法连接 TWS，请确认桌面端账户模式与 API 已开启。")
+        return
+
+    await update.message.reply_text("🔍 正在扫描 TWS 物理持仓…")
+    try:
+        positions = await ib.reqPositionsAsync()
+    except Exception as e:
+        await update.message.reply_text(f"❌ 拉取持仓失败: {e}")
+        return
+
+    imported: list[str] = []
+    async with connect_db() as conn:
+        conn.row_factory = aiosqlite.Row
+        for pos in positions:
+            if pos.position == 0 or pos.contract.secType != "STK":
+                continue
+            sym = pos.contract.symbol
+            raw_qty = float(pos.position)
+            side = "LONG" if raw_qty > 0 else "SHORT"
+            qty = abs(raw_qty)
+            entry = float(pos.avgCost)
+            if entry <= 0:
+                continue
+            cur = await conn.execute(
+                "SELECT id FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
+                (sym,),
+            )
+            if await cur.fetchone():
+                continue
+            tranche_id = f"T{await count_open_tranches(conn, sym) + 1}"
+            await conn.execute(
+                "INSERT INTO shadow_ledger "
+                "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
+                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'IMPORT')",
+                (sym, tranche_id, side, qty, entry),
+            )
+            imported.append(f"{side} {sym} {qty:.0f}股 @ {entry:.2f}")
+        await conn.commit()
+
+    if not imported:
+        await update.message.reply_text(
+            "ℹ️ 未发现新的物理持仓。账本中已有的标的已跳过。\n"
+            "请用 /status 查看，无止损仓位会标 ⚠️ 裸奔。"
+        )
+        return
+    detail = "\n".join(f"  • {line}" for line in imported)
+    await update.message.reply_text(
+        f"✅ 成功收编 {len(imported)} 笔物理持仓：\n{detail}\n\n"
+        f"请 /status 查看，并用 /update [代码] [止损] 补齐防线。"
+    )
 
 
 @require_auth
@@ -1304,8 +1368,9 @@ def _dispatch_async(coro):
         loop.call_soon_threadsafe(_spawn_background_task, coro)
 
 
-def on_execution(trade):
-    _dispatch_async(_async_on_execution(trade))
+def on_execution(trade, fill):
+    """ib_insync execDetailsEvent 固定传入 (trade, fill) 两个参数。"""
+    _dispatch_async(_async_on_execution(trade, fill))
 
 
 async def _apply_consecutive_losses(conn, profitable: bool, losing: bool) -> None:
@@ -1386,9 +1451,9 @@ async def _night_watchman_on_tp(trade, execution) -> None:
         print(f"守夜人保本钩子失败: {e}")
 
 
-async def _async_on_execution(trade):
-    execution = trade.execution
-    contract = trade.contract
+async def _async_on_execution(trade, fill):
+    execution = fill.execution
+    contract = fill.contract
     symbol = contract.symbol
     side = "LONG" if execution.side == "BOT" else "SHORT"
     qty = float(execution.shares)
@@ -1844,6 +1909,7 @@ def main() -> None:
     tg_app.add_handler(CommandHandler("start", cmd_start))
     tg_app.add_handler(CommandHandler("init", cmd_init))
     tg_app.add_handler(CommandHandler("status", cmd_status))
+    tg_app.add_handler(CommandHandler("import", cmd_import))
     tg_app.add_handler(CommandHandler("reconcile", cmd_reconcile))
     tg_app.add_handler(CommandHandler("sync", cmd_sync))
     tg_app.add_handler(CommandHandler("override", cmd_override))
