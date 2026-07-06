@@ -77,6 +77,12 @@ async def ensure_schema() -> None:
             'INSERT OR IGNORE INTO system_state (key, value) VALUES ("consecutive_losses", "0")'
         )
         await db.execute(
+            'INSERT OR IGNORE INTO system_state (key, value) VALUES ("last_reset_date", "")'
+        )
+        await db.execute(
+            'INSERT OR IGNORE INTO system_state (key, value) VALUES ("last_review_date", "")'
+        )
+        await db.execute(
             """
             CREATE TABLE IF NOT EXISTS auth_tokens (
                 symbol TEXT PRIMARY KEY,

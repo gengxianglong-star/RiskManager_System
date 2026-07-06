@@ -44,6 +44,7 @@ def _patch_ib_asyncio_once() -> None:
 
 from config import (
     CLIENT_ID,
+    ENABLE_EOD_SNIPER,
     FLEX_QUERY_ID,
     FLEX_TOKEN,
     MAX_POSITION_SIZE_PCT,
@@ -274,62 +275,65 @@ def calc_share_quantity(risk_budget: float, entry_price: float, stop_price: floa
     return int(risk_budget / risk_per_share)
 
 
+def _is_bear_thrust_regime(regime_label: str, risk_mult: float) -> bool:
+    return risk_mult == 0.0 or "BEAR THRUST" in regime_label.upper()
+
+
+def _is_bull_thrust_regime(regime_label: str) -> bool:
+    return "BULL THRUST" in regime_label.upper()
+
+
 async def validate_pending_entry(
     conn,
     entry_price: float,
     stop_price: float,
     quantity: float,
     equity: float,
+    is_buy: bool,
 ) -> str | None:
     """确认入账前二次校验，通过返回 None，否则返回拒绝文案。"""
     today_count = await get_today_trade_count(conn)
     if today_count >= MAX_DAILY_TRADES:
         return (
             f"🛑 **狙击手协议触发！**\n"
-            f"今日弹夹已打空 ({today_count}/{MAX_DAILY_TRADES})。请重新 /init。"
+            f"今日弹夹已打空 ({today_count}/{MAX_DAILY_TRADES})。"
         )
 
     risk_light, base_risk_budget = await calculate_risk_light(conn, equity)
     if base_risk_budget <= 0:
-        return f"🚨 风控灯 {risk_light}，当前禁止新开仓。请重新 /init。"
+        return f"🚨 风控灯 {risk_light}，当前禁止新开仓。"
 
-    _, _, risk_mult = await fetch_market_regime()
-    if risk_mult == 0.0:
-        return "🛑 **宏观环境一票否决！** Bear Thrust 下禁止建仓。请重新 /init。"
+    regime_label, _, risk_mult = await fetch_market_regime()
 
-    if entry_price > 0:
-        risk_pct = abs(entry_price - stop_price) / entry_price
-        if risk_pct > MAX_STOP_PCT:
+    if is_buy:
+        if _is_bear_thrust_regime(regime_label, risk_mult):
             return (
-                f"🚨 止损距离 {risk_pct * 100:.2f}% 超过 {MAX_STOP_PCT * 100:.0f}% 上限。"
-                f"请重新 /init。"
+                "🛑 **多头环境一票否决！** Bear Thrust 属于大盘下行坍塌期，严禁做多突破。"
+            )
+    else:
+        if _is_bull_thrust_regime(regime_label):
+            return (
+                "🛑 **空头环境一票否决！** Bull Thrust 属于大盘强动量轧空期，严禁逆势做空。"
             )
 
     cursor = await conn.execute(
-        "SELECT entry_price, current_stop, quantity FROM shadow_ledger WHERE status='OPEN'"
+        "SELECT entry_price, current_stop, quantity, side FROM shadow_ledger "
+        "WHERE status='OPEN'"
     )
     open_positions = await cursor.fetchall()
     current_total_risk = 0.0
     for pos in open_positions:
-        pos_entry = float(pos["entry_price"])
-        pos_stop = float(pos["current_stop"])
-        pos_qty = float(pos["quantity"])
-        current_total_risk += max(0.0, abs(pos_entry - pos_stop) * pos_qty)
+        p_entry = float(pos["entry_price"])
+        p_stop = float(pos["current_stop"])
+        p_qty = float(pos["quantity"])
+        current_total_risk += max(0.0, abs(p_entry - p_stop) * p_qty)
 
-    new_trade_risk = abs(entry_price - stop_price) * quantity
-    projected_total_risk = current_total_risk + new_trade_risk
-    max_allowed_risk = equity * MAX_OVERNIGHT_RISK_PCT
-    if projected_total_risk > max_allowed_risk:
-        pct_str = (
-            f"{(projected_total_risk / equity) * 100:.2f}%"
-            if equity > 0
-            else "N/A"
+    if stop_price > 0:
+        projected_total_risk = current_total_risk + (
+            abs(entry_price - stop_price) * quantity
         )
-        return (
-            f"🛑 **隔夜风险总闸触发！**\n"
-            f"合并后风险 ${projected_total_risk:.2f} ({pct_str})，"
-            f"超过极限 {MAX_OVERNIGHT_RISK_PCT * 100:.2f}%。请重新 /init。"
-        )
+        if projected_total_risk > equity * MAX_OVERNIGHT_RISK_PCT:
+            return "🛑 **隔夜风险总闸触发！** 跨单合并总风险超标。"
 
     return None
 
@@ -520,7 +524,7 @@ async def reconcile_physical_positions(tg_application):
 
 
 async def execute_kill_switch(symbol: str, trigger_reason: str = "手动授权") -> str:
-    """核心斩立决逻辑，支持 Telegram 手动与 10EMA 自动触发。"""
+    """核心斩立决逻辑，支持 Telegram 手动与 EOD Sniper 自动触发。"""
     if not await ensure_ib_connected():
         return "❌ TWS 未连接，清仓失败。请手动在 TWS 操作！"
 
@@ -566,6 +570,77 @@ async def execute_kill_switch(symbol: str, trigger_reason: str = "手动授权")
         )
     except Exception as e:
         return f"❌ 斩立决发生异常: {e}"
+
+
+async def eod_10ema_sniper_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """【收盘前5分钟审判】美东 15:55 唤醒，无视盘中洗盘，只看收盘定局。"""
+    print("🎯 [EOD Sniper] 唤醒：执行收盘前 10EMA 破位终极审判...")
+
+    ny_tz = ZoneInfo("America/New_York")
+    now_ny = datetime.datetime.now(ny_tz)
+    nyse = mcal.get_calendar("NYSE")
+    if len(nyse.valid_days(start_date=now_ny.date(), end_date=now_ny.date())) == 0:
+        print("非美股交易日，EOD Sniper 跳过。")
+        return
+
+    if not await ensure_ib_connected():
+        print("❌ TWS 未连接，EOD Sniper 无法执行。将由物理止损单接管防线。")
+        return
+
+    async with connect_db() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT symbol, side FROM shadow_ledger WHERE status='OPEN'"
+        )
+        open_positions = await cursor.fetchall()
+
+    if not open_positions:
+        return
+
+    alerts: list[str] = []
+    for pos in open_positions:
+        sym = pos["symbol"]
+        side = pos["side"]
+
+        ema_10 = await get_10ema(sym)
+        current_price, _ = await fetch_entry_price(sym)
+
+        if not (ema_10 and current_price and ema_10 > 0):
+            continue
+
+        is_broken = (
+            current_price < ema_10 * 0.99
+            if side == "LONG"
+            else current_price > ema_10 * 1.01
+        )
+
+        if is_broken:
+            msg = (
+                f"📉 **EOD 结构破位审判** `{sym}`\n"
+                f"现价: ${current_price:.2f} | 10EMA: ${ema_10:.2f}\n"
+                f"距离收盘仅剩 5 分钟，股价已无力收复 10EMA。\n"
+                f"⚠️ 日线破位已成定局，放弃幻想，系统正在强制斩仓！"
+            )
+            await context.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=msg)
+
+            kill_result = await execute_kill_switch(
+                sym, trigger_reason="15:55 EOD 10EMA 日线终极破位"
+            )
+            await context.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=kill_result)
+            alerts.append(sym)
+        else:
+            print(
+                f"🛡️ {sym} 现价 ${current_price:.2f} 稳居 10EMA (${ema_10:.2f}) 防线之上，允许安全过夜。"
+            )
+
+    if not alerts:
+        await context.bot.send_message(
+            chat_id=MY_TELEGRAM_CHAT_ID,
+            text=(
+                "✅ **EOD 审判完毕**\n"
+                "所有持仓均已成功扛过洗盘并守住 10EMA 防线。军师系统继续潜伏，安心睡觉！"
+            ),
+        )
 
 
 @require_auth
@@ -622,41 +697,67 @@ async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def morning_review_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [
-        [
-            InlineKeyboardButton("1 (失控)", callback_data="review_1"),
-            InlineKeyboardButton("2", callback_data="review_2"),
-            InlineKeyboardButton("3 (及格)", callback_data="review_3"),
-            InlineKeyboardButton("4", callback_data="review_4"),
-            InlineKeyboardButton("5 (完美)", callback_data="review_5"),
-        ]
-    ]
-    await context.bot.send_message(
-        chat_id=MY_TELEGRAM_CHAT_ID,
-        text=(
-            "🌅 **晨间审判 (Morning Review)**\n\n"
-            "请客观评估你**昨天**的纪律执行情况：\n"
-            "(如：是否无脑追高、是否执行了3R减仓、是否知行合一)"
-        ),
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
+async def run_daily_boot_checks(app: Application) -> None:
+    """开机自检引擎：确保每日任务只在当天第一次开机时执行一次。"""
+    shanghai_tz = ZoneInfo("Asia/Shanghai")
+    today_str = datetime.datetime.now(shanghai_tz).strftime("%Y-%m-%d")
 
-
-async def reset_daily_status_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """盘前重置连亏计数，恢复当日交易额度感知。"""
-    async with connect_db() as conn:
-        await conn.execute(
-            "UPDATE system_state SET value='0' WHERE key='consecutive_losses'"
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "SELECT value FROM system_state WHERE key='last_reset_date'"
         )
-        await conn.commit()
-    await context.bot.send_message(
-        chat_id=MY_TELEGRAM_CHAT_ID,
-        text=(
-            "🔄 **每日盘前重置**\n"
-            "系统连亏状态已归零，您的交易额度已恢复，今天也要坚守纪律！"
-        ),
-    )
+        row = await cursor.fetchone()
+        last_reset = row[0] if row else ""
+
+        if last_reset != today_str:
+            await db.execute(
+                "UPDATE system_state SET value='0' WHERE key='consecutive_losses'"
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO system_state (key, value) VALUES ('last_reset_date', ?)",
+                (today_str,),
+            )
+            await db.commit()
+
+            await app.bot.send_message(
+                chat_id=MY_TELEGRAM_CHAT_ID,
+                text=(
+                    "🔄 **系统启动自检**\n"
+                    "发现跨日，连亏状态已归零，您的交易额度已恢复，今天也要坚守纪律！"
+                ),
+            )
+
+        cursor = await db.execute(
+            "SELECT value FROM system_state WHERE key='last_review_date'"
+        )
+        row = await cursor.fetchone()
+        last_review = row[0] if row else ""
+
+        if last_review != today_str:
+            await db.execute(
+                "INSERT OR REPLACE INTO system_state (key, value) VALUES ('last_review_date', ?)",
+                (today_str,),
+            )
+            await db.commit()
+
+            keyboard = [
+                [
+                    InlineKeyboardButton("1 (失控)", callback_data="review_1"),
+                    InlineKeyboardButton("2", callback_data="review_2"),
+                    InlineKeyboardButton("3 (及格)", callback_data="review_3"),
+                    InlineKeyboardButton("4", callback_data="review_4"),
+                    InlineKeyboardButton("5 (完美)", callback_data="review_5"),
+                ]
+            ]
+            await app.bot.send_message(
+                chat_id=MY_TELEGRAM_CHAT_ID,
+                text=(
+                    "🌅 **开机复盘审判 (Boot Review)**\n\n"
+                    "请客观评估你**上一个交易日**的纪律执行情况：\n"
+                    "(如：是否无脑追高、是否执行了3R减仓)"
+                ),
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
 
 
 def _shanghai_day_utc_bounds(day_offset: int = 0) -> tuple[str, str, str]:
@@ -951,6 +1052,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 float(pending["stop_price"]),
                 float(pending["quantity"]),
                 equity,
+                is_buy=True,
             )
             if reject_reason:
                 await delete_pending_intent(conn, intent_id)
@@ -1249,6 +1351,30 @@ async def _async_on_execution(trade):
         opening = not open_tranches or open_tranches[0]["side"] == side
 
         if opening:
+            stop_for_val = 0.0
+            if ib.isConnected():
+                for open_trade in ib.openTrades():
+                    if (
+                        open_trade.contract.symbol == symbol
+                        and open_trade.order.orderType in ("STP", "STP LMT")
+                    ):
+                        stop_for_val = float(open_trade.order.auxPrice)
+                        break
+            equity = await fetch_account_equity()
+            reject_reason = await validate_pending_entry(
+                conn,
+                price,
+                stop_for_val,
+                qty,
+                equity,
+                is_buy=(side == "LONG"),
+            )
+            if reject_reason:
+                await _notify_user(
+                    f"🛑 **UI 开仓被风控驳回** `{symbol}`\n{reject_reason}"
+                )
+                return
+
             tz = ZoneInfo(TRADING_TZ)
             now = datetime.datetime.now(tz)
             day_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
@@ -1533,10 +1659,9 @@ async def get_10ema(symbol: str) -> float:
 
 
 async def active_position_monitor(tg_application):
-    """【3R 腾挪与 10EMA 追踪引擎】后台每 5 分钟巡检一次。"""
+    """【3R 腾挪引擎】后台每 5 分钟巡检；10EMA 斩仓交由 EOD Sniper (美东 15:55)。"""
     await asyncio.sleep(15)
     notified_3r: dict[str, float] = {}
-    notified_ema: set[str] = set()
     remind_3r_interval = 4 * 3600
 
     print("✅ 动态仓位巡检器 (Scale-out Financer) 已在后台启动...")
@@ -1580,11 +1705,8 @@ async def active_position_monitor(tg_application):
                 at_risk = (
                     current_stop < entry if side == "LONG" else current_stop > entry
                 )
-                at_breakeven = (
-                    current_stop >= entry if side == "LONG" else current_stop <= entry
-                )
 
-                # 规则 1：3R 强制减仓与平推止损提醒（3R 区内每 4 小时重复督促）
+                # 3R 强制减仓提醒（盘中）；10EMA 破位仅在美东 15:55 EOD Sniper 执行
                 cache_key_3r = f"{trade_id}_3R"
                 if current_r_multiple >= 3.0 and at_risk:
                     now_ts = time.time()
@@ -1603,37 +1725,6 @@ async def active_position_monitor(tg_application):
                             chat_id=MY_TELEGRAM_CHAT_ID, text=alert_msg
                         )
                         notified_3r[cache_key_3r] = now_ts
-
-                elif at_breakeven:
-                    notified_3r.pop(cache_key_3r, None)
-                    ema_10 = await get_10ema(symbol)
-                    ema_break = (
-                        current_price < (ema_10 * 0.99)
-                        if side == "LONG"
-                        else current_price > (ema_10 * 1.01)
-                    )
-                    if ema_10 > 0 and ema_break:
-                        cache_key = f"{trade_id}_10EMA"
-                        if cache_key not in notified_ema:
-                            notified_ema.add(cache_key)
-                            alert_msg = (
-                                f"🛑 **【尾仓趋势终结 - 机器代管介入】** `{symbol}`\n\n"
-                                f"当前价格: ${current_price:.2f}\n"
-                                f"昨日 10EMA: ${ema_10:.2f}\n\n"
-                                f"⚠️ 价格已有效跌破 10EMA，动量已衰竭！\n"
-                                f"🤖 **系统判定为危险，正在自动执行斩立决程序...**"
-                            )
-                            await tg_application.bot.send_message(
-                                chat_id=MY_TELEGRAM_CHAT_ID,
-                                text=alert_msg,
-                            )
-                            kill_result = await execute_kill_switch(
-                                symbol, trigger_reason="10EMA跌破机器自动熔断"
-                            )
-                            await tg_application.bot.send_message(
-                                chat_id=MY_TELEGRAM_CHAT_ID,
-                                text=kill_result,
-                            )
 
                 else:
                     notified_3r.pop(cache_key_3r, None)
@@ -1657,15 +1748,10 @@ async def ib_keepalive():
         await asyncio.sleep(30)
 
 
-async def automated_pre_market_routine(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """20:30 后台静默 Flex 对账 + 公司行动巡检（不关机的双重保障）。"""
-    await sync_flex_query(context)
-    await check_corporate_actions(context)
-
-
 async def _post_init(app: Application) -> None:
     bind_tg_bot(app.bot)
     await ensure_schema()
+    _spawn_background_task(run_daily_boot_checks(app))
     _spawn_background_task(sync_flex_query(app))
     _spawn_background_task(check_corporate_actions(app))
     if await ensure_ib_connected():
@@ -1678,24 +1764,6 @@ async def _post_init(app: Application) -> None:
         await reconcile_physical_positions(app)
     else:
         print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
-    if app.job_queue:
-        shanghai_tz = ZoneInfo("Asia/Shanghai")
-        app.job_queue.run_daily(
-            morning_review_job,
-            time=datetime.time(9, 0, tzinfo=shanghai_tz),
-            name="morning_review",
-        )
-        app.job_queue.run_daily(
-            reset_daily_status_job,
-            time=datetime.time(20, 0, tzinfo=shanghai_tz),
-            name="reset_daily_status",
-        )
-        app.job_queue.run_daily(
-            automated_pre_market_routine,
-            time=datetime.time(20, 30, tzinfo=shanghai_tz),
-            name="pre_market_routine",
-        )
-        print("✅ 定时任务已注册 (09:00 晨间审判 / 20:00 连亏重置 / 20:30 静默对账巡检)")
     _spawn_background_task(heartbeat_2300(app))
     _spawn_background_task(ib_keepalive())
     _spawn_background_task(active_position_monitor(app))
@@ -1721,10 +1789,24 @@ def main() -> None:
     tg_app.add_handler(CallbackQueryHandler(review_callback, pattern="^review_"))
     tg_app.add_handler(CallbackQueryHandler(button_handler))
 
+    if ENABLE_EOD_SNIPER and tg_app.job_queue:
+        ny_tz = ZoneInfo("America/New_York")
+        tg_app.job_queue.run_daily(
+            eod_10ema_sniper_job,
+            time=datetime.time(hour=15, minute=55, tzinfo=ny_tz),
+            name="eod_10ema_sniper",
+        )
+        print("🔭 [VPS 云端模式] EOD 收盘狙击手引擎已装载。")
+    elif ENABLE_EOD_SNIPER:
+        print("⚠️ ENABLE_EOD_SNIPER=True 但 job_queue 不可用，EOD 狙击手未注册。")
+    else:
+        print("💻 [本地关机模式] EOD 狙击手休眠，夜间防线由 TWS 物理止损单全面接管。")
+
     async def runner() -> None:
         async with tg_app:
             await tg_app.start()
-            print("✅ Telegram Bot 轮询已启动。")
+            mode = "EOD 狙击手" if ENABLE_EOD_SNIPER else "物理止损兜底"
+            print(f"✅ Telegram Bot 军师巡检器已启动 (状态自检 + {mode})。")
             await tg_app.updater.start_polling(drop_pending_updates=True)
             await asyncio.Event().wait()
 

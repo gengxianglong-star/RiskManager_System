@@ -30,3 +30,16 @@ MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))
 
 # 总隔夜风险上限 (占净值比例，推荐 0.015 即 1.5%)
 MAX_OVERNIGHT_RISK_PCT = float(os.getenv("MAX_OVERNIGHT_RISK_PCT", "0.015"))
+
+# ==========================================
+# 部署环境与高级引擎开关 (Deployment & Engine Toggles)
+# ==========================================
+
+# EOD 10EMA 狙击手开关。
+# - 本地关机模式 (False): 依靠 TWS 物理止损单防守，忽略收盘破位。
+# - 云端 VPS 模式 (True): 24 小时在线，美东 15:55 准时执行日线破位审判。
+ENABLE_EOD_SNIPER = os.getenv("ENABLE_EOD_SNIPER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
