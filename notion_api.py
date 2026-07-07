@@ -1,5 +1,6 @@
 from notion_client import AsyncClient
 import aiosqlite
+import asyncio
 
 from config import NOTION_DATABASE_ID, NOTION_TOKEN
 from database import connect_db
@@ -9,6 +10,24 @@ notion = (
     if NOTION_TOKEN and NOTION_TOKEN != "YOUR_NOTION_TOKEN"
     else None
 )
+
+
+async def check_notion_online() -> tuple[bool, str]:
+    """探测 Notion API 与交易复盘库是否可达。"""
+    if not notion:
+        return False, "未配置 Token"
+    if NOTION_DATABASE_ID == "YOUR_NOTION_DATABASE_ID":
+        return False, "未配置数据库 ID"
+    try:
+        await asyncio.wait_for(
+            notion.databases.retrieve(database_id=NOTION_DATABASE_ID),
+            timeout=5.0,
+        )
+        return True, "已连"
+    except asyncio.TimeoutError:
+        return False, "超时"
+    except Exception as exc:
+        return False, type(exc).__name__
 
 
 async def push_to_notion(trade_id, symbol, realized_pnl, setup_tag, confession=""):
@@ -36,6 +55,7 @@ async def push_to_notion(trade_id, symbol, realized_pnl, setup_tag, confession="
                     exit_price = float(row["exit_price"] or 0.0)
         except Exception as db_e:
             print(f"⚠️ Notion 读取本地数据库失败: {db_e}")
+            return
 
         properties = {
             "Tranche ID": {"title": [{"text": {"content": f"{symbol}-{trade_id}"}}]},

@@ -1,4 +1,5 @@
 import datetime
+from contextlib import asynccontextmanager
 from zoneinfo import ZoneInfo
 
 import aiosqlite
@@ -6,9 +7,16 @@ import aiosqlite
 from config import DB_PATH, DB_TIMEOUT, TRADING_TZ
 
 
-def connect_db():
-    """带锁等待超时的 SQLite 连接，降低并发写入时的 database is locked。"""
-    return aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
+@asynccontextmanager
+async def connect_db():
+    """带连接级 PRAGMA 的 SQLite 连接生成器。"""
+    conn = await aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
+    try:
+        await conn.execute("PRAGMA synchronous=NORMAL;")
+        await conn.execute("PRAGMA busy_timeout=10000;")
+        yield conn
+    finally:
+        await conn.close()
 
 
 def trading_now() -> datetime.datetime:
@@ -21,6 +29,7 @@ def trading_today_iso() -> str:
 
 async def ensure_schema() -> None:
     async with connect_db() as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS shadow_ledger (
