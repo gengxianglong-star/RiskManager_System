@@ -23,7 +23,15 @@ import pandas as pd
 import pandas_market_calendars as mcal
 import yfinance as yf
 from ib_insync import IB, FlexReport, MarketOrder, Stock, util
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    Bot,
+    BotCommand,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 ib = IB()
@@ -691,60 +699,95 @@ async def eod_10ema_sniper_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+START_HELP_TEXT = (
+    "🛡️ **钢铁军师系统已上线 (EOD & 自检引擎运作中)**\n\n"
+    "【日常监控】\n"
+    "📊 /status — 查看当前持仓、净值与裸奔预警\n\n"
+    "【风控解锁】\n"
+    "🔓 /unlock [代码] [检讨≥15字] — 解锁桌面端F9发单权限 (限时5分钟)\n"
+    "📝 /override [代码] [坦白理由] — 越权违规仓位事后坦白与接纳\n\n"
+    "【系统维护】\n"
+    "📥 /import — 一键强制收编 TWS 的未知物理持仓\n"
+    "*(注: 拆股/更名/对账/止损推移均已由后台静默自动化接管)*"
+)
+
+# Telegram「/」快捷菜单：仅暴露核心四件套；其余 cmd 保留为隐藏后门
+BOT_COMMANDS = [
+    BotCommand("start", "指令帮助"),
+    BotCommand("status", "持仓净值与裸奔预警"),
+    BotCommand("unlock", "解锁 F9 发单权限"),
+    BotCommand("override", "越权仓位坦白"),
+    BotCommand("import", "收编 TWS 物理持仓"),
+]
+
+
+async def _sync_bot_commands_for(bot: Bot) -> list[str]:
+    scopes = [BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()]
+    for scope in scopes:
+        await bot.delete_my_commands(scope=scope)
+        await bot.set_my_commands(BOT_COMMANDS, scope=scope)
+    current = await bot.get_my_commands(scope=BotCommandScopeDefault())
+    return [c.command for c in current]
+
+
+async def _sync_bot_commands(app: Application) -> None:
+    names = await _sync_bot_commands_for(app.bot)
+    print(f"✅ Telegram 命令菜单已同步: {', '.join(names)}")
+
+
 @require_auth
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🛡️ 极客级动量风控军师\n\n"
-        "/init [代码] [止损价] [策略标签] — 开仓前审查\n"
-        "/status — 持仓与风控灯\n"
-        "/override [代码] [坦白理由] — 越权坦白\n"
-        "/update [代码] [新止损价] — 移动止损\n"
-        "/split [代码] [比例] — 拆/合股调整\n"
-        "/rename [旧代码] [新代码] — 代码更名\n"
-        "/unlock [代码] [检讨≥15字] — 解锁桌面端 F9 越权下单\n"
-        "/import — 收编 TWS 历史持仓进影子账本\n"
-        "/reconcile — 物理仓位对账\n"
-        "/sync — 手动 Flex 对账"
-    )
-    await update.message.reply_text(text)
+    try:
+        await _sync_bot_commands_for(context.bot)
+    except Exception as e:
+        print(f"⚠️ /start 命令菜单同步失败: {e}")
+    await update.message.reply_text(START_HELP_TEXT)
 
 
 @require_auth
 async def cmd_unlock(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    if len(args) < 2:
-        await update.message.reply_text(
-            "⚠️ 格式错误。\n正确格式: /unlock [Ticker] [不少于15个字的检讨理由]"
-        )
-        return
-    symbol = args[0].upper()
-    confession = " ".join(args[1:]).strip()
-    if len(confession) < 15:
-        await update.message.reply_text(
-            f"❌ 检讨不够深刻：当前 {len(confession)} 字，至少需要 15 字。\n"
-            f"示例：/unlock TSLA 这是一个完美的VCP突破，严格止损在昨日低点下方"
-        )
-        return
-
     try:
+        msg_text = update.effective_message.text if update.effective_message else "未知消息"
+        print(f"📥 [指令触达] 收到解锁请求: {msg_text}")
+
+        args = context.args or []
+        if len(args) < 2:
+            await update.effective_message.reply_text(
+                "⚠️ 格式错误。\n"
+                "正确格式: /unlock [代码] [不少于15个字的检讨理由]\n"
+                "示例: /unlock TSLA 这是一笔绝佳的放量突破值得一试"
+            )
+            return
+
+        symbol = args[0].upper()
+        confession = " ".join(args[1:]).strip()
+
+        if len(confession) < 15:
+            await update.effective_message.reply_text(
+                f"❌ 检讨不够深刻：当前仅 {len(confession)} 字，至少需要 15 字。\n"
+                f"你刚刚写的理由是：{confession}"
+            )
+            return
+
         async with connect_db() as conn:
             await conn.execute(
                 "INSERT OR REPLACE INTO auth_tokens (symbol, confession, expire_time) "
-                "VALUES (?, ?, datetime('now', '+5 minutes'))",
+                "VALUES (?, ?, datetime('now', 'localtime', '+5 minutes'))",
                 (symbol, confession),
             )
             await conn.commit()
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ 写入解锁令牌失败: {e}\n请先重启军师并运行 `python database_setup.py` 建表。"
-        )
-        return
 
-    await update.message.reply_text(
-        f"🔓 **授权已下发**\n"
-        f"[{symbol}] 的极速下单(F9)权限已解锁，有效期 5 分钟。\n"
-        f"理由：{confession}"
-    )
+        await update.effective_message.reply_text(
+            f"🔓 **授权已下发**\n"
+            f"[{symbol}] 的极速下单(F9)权限已解锁，有效期 5 分钟。\n"
+            f"理由：{confession}"
+        )
+        print(f"✅ /unlock 授权下发成功: {symbol}")
+
+    except Exception as e:
+        print(f"❌ /unlock 后台执行异常: {e}")
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ 系统级异常: {e}")
 
 
 async def run_daily_boot_checks(app: Application) -> None:
@@ -889,40 +932,76 @@ async def review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @require_auth
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    equity = await fetch_account_equity()
-    async with connect_db() as conn:
-        conn.row_factory = aiosqlite.Row
-        risk_light, risk_budget = await calculate_risk_light(conn, equity)
-        await upsert_account_state(conn, equity, risk_light)
+    try:
+        equity = await fetch_account_equity()
+        async with connect_db() as conn:
+            conn.row_factory = aiosqlite.Row
+            risk_light, risk_budget = await calculate_risk_light(conn, equity)
+            await upsert_account_state(conn, equity, risk_light)
+            cur = await conn.execute(
+                "SELECT symbol, tranche_id, side, quantity, entry_price, current_stop, initial_stop, setup_tag "
+                "FROM shadow_ledger WHERE status='OPEN' ORDER BY symbol, create_time"
+            )
+            rows = await cur.fetchall()
 
-        cur = await conn.execute(
-            "SELECT symbol, tranche_id, side, quantity, entry_price, current_stop, initial_stop, setup_tag "
-            "FROM shadow_ledger WHERE status='OPEN' ORDER BY symbol, create_time"
-        )
-        rows = await cur.fetchall()
-
-        lines = [
-            f"💰 净值: ${equity:,.2f}",
-            f"🚦 风控灯: {risk_light}",
-            f"📐 单笔风险预算: ${risk_budget:,.2f}",
-            "",
-        ]
-        if not rows:
-            lines.append("📭 当前无 OPEN 影子仓位。")
-            lines.append("*(提示: 模拟盘老仓请先发 /import 收编)*")
-        else:
-            lines.append("📒 影子账本 OPEN:")
+            current_total_risk = 0.0
             for r in rows:
+                entry = float(r["entry_price"])
                 stop = float(r["current_stop"])
-                initial = float(r["initial_stop"])
-                naked = stop == 0.0 and initial == 0.0
-                warn = " ⚠️ [危险: 无止损(裸奔)]" if naked else ""
-                lines.append(
-                    f"  • {r['side']} {r['symbol']} {r['tranche_id']} "
-                    f"{r['quantity']:.0f}股 @ {r['entry_price']:.2f} "
-                    f"stop {stop:.2f} [{r['setup_tag'] or '未打标'}]{warn}"
-                )
-        await update.message.reply_text("\n".join(lines))
+                qty = float(r["quantity"])
+                if stop > 0:
+                    current_total_risk += abs(entry - stop) * qty
+                else:
+                    current_total_risk += entry * qty
+
+            total_risk_pct = (current_total_risk / equity) * 100 if equity > 0 else 0.0
+            risk_budget_pct = (risk_budget / equity) * 100 if equity > 0 else 0.0
+
+            light_desc = ""
+            if "绿灯" in risk_light:
+                light_desc = "(状态良好，全额开火权)"
+            elif "黄灯" in risk_light:
+                light_desc = "(回撤预警，单笔额度已强制减半)"
+            elif "红灯" in risk_light:
+                light_desc = "(严重回撤，已禁止新开仓)"
+
+            lines = [
+                f"💰 净值: ${equity:,.2f}",
+                f"🚦 风控灯: {risk_light} {light_desc}",
+                f"📐 单笔额度: ${risk_budget:,.2f} ({risk_budget_pct:.2f}%)",
+                f"🔥 总敞口风险: ${current_total_risk:,.2f} ({total_risk_pct:.2f}%)",
+                "",
+            ]
+            if not rows:
+                lines.append("📭 无 OPEN 影子仓位。")
+                lines.append("*(若实盘有单，请先发送 /import)*")
+            else:
+                lines.append("📋 影子账本 OPEN:")
+                for r in rows:
+                    stop = float(r["current_stop"])
+                    initial = float(r["initial_stop"])
+                    naked = stop == 0.0 and initial == 0.0
+                    warn = " ⚠️ [危险: 无止损(裸奔)]" if naked else ""
+                    lines.append(
+                        f"  • {r['side']} {r['symbol']} {r['tranche_id']} "
+                        f"{r['quantity']:.0f}股 @ {r['entry_price']:.2f} "
+                        f"stop {stop:.2f} [{r['setup_tag'] or ' '}]{warn}"
+                    )
+
+            chunk: list[str] = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 4000:
+                    await update.message.reply_text("\n".join(chunk))
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                await update.message.reply_text("\n".join(chunk))
+    except Exception as e:
+        print(f"/status 指令后台异常: {e}")
+        await update.message.reply_text(f"❌ 状态获取失败 (系统级拦截): {e}")
 
 
 @require_auth
@@ -1207,10 +1286,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        args = context.args
+        msg_text = update.effective_message.text if update.effective_message else "未知消息"
+        print(f"📥 [指令触达] 收到越权坦白请求: {msg_text}")
+
+        args = context.args or []
         if len(args) < 2:
-            await update.message.reply_text("⚠️ 格式错误！/override [代码] [坦白理由]")
+            await update.effective_message.reply_text(
+                "⚠️ 格式错误！\n正确格式: /override [代码] [坦白理由]"
+            )
             return
+
         symbol = args[0].upper()
         reason = " ".join(args[1:])
 
@@ -1221,8 +1306,11 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (symbol,),
             )
             rows = await cur.fetchall()
+
             if not rows:
-                await update.message.reply_text(f"ℹ️ {symbol} 无待坦白的越权仓位。")
+                await update.effective_message.reply_text(
+                    f"ℹ️ {symbol} 无待坦白的越权仓位 (此仓位可能已平仓，或本身合规)。"
+                )
                 return
 
             await conn.execute(
@@ -1232,17 +1320,22 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 (symbol,),
             )
             await conn.commit()
+
             for row in rows:
                 _spawn_background_task(
                     push_to_notion(row["id"], symbol, 0.0, "FOMO", confession=reason)
                 )
 
-        await update.message.reply_text(
-            f"💀 已记录坦白: {symbol} - {reason}\n这笔交易已被接纳，但打上了违规标签。"
+        await update.effective_message.reply_text(
+            f"💀 已记录坦白: {symbol} - {reason}\n"
+            f"这笔交易已被军师系统接纳，但已打上违规标签。"
         )
+        print(f"✅ /override 记录成功: {symbol}")
+
     except Exception as e:
-        print(f"Override Error: {e}")
-        await update.message.reply_text(f"❌ 坦白记录失败: {e}")
+        print(f"❌ /override 后台执行异常: {e}")
+        if update.effective_message:
+            await update.effective_message.reply_text(f"❌ 坦白记录失败: {e}")
 
 
 @require_auth
@@ -1880,6 +1973,10 @@ async def ib_keepalive():
 async def _post_init(app: Application) -> None:
     bind_tg_bot(app.bot)
     await ensure_schema()
+    try:
+        await _sync_bot_commands(app)
+    except Exception as e:
+        print(f"⚠️ Telegram 命令菜单同步失败: {e}")
     _spawn_background_task(run_daily_boot_checks(app))
     _spawn_background_task(sync_flex_query(app))
     _spawn_background_task(check_corporate_actions(app))
