@@ -119,6 +119,50 @@ async def ensure_schema() -> None:
             )
             """
         )
+        # 兼容旧表结构
+        try:
+            await db.execute("ALTER TABLE notion_queue ADD COLUMN notion_page_id TEXT")
+        except Exception:
+            pass
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notion_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                notion_page_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sent INTEGER DEFAULT 0,
+                retry_count INTEGER DEFAULT 0,
+                UNIQUE(trade_id, event_type)
+            )
+            """
+        )
+        # 出站队列表（复用当前连接，避免锁冲突）
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=15000;")
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS outbound_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL,
+                channel TEXT NOT NULL CHECK(channel IN ('telegram', 'notion')),
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER DEFAULT 0,
+                notion_page_id TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                sent_at DATETIME,
+                UNIQUE(event_key, channel)
+            )
+            """
+        )
+        try:
+            await db.execute("ALTER TABLE outbound_queue ADD COLUMN notion_page_id TEXT")
+        except Exception:
+            pass
         await db.commit()
 
 

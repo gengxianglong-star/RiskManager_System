@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import os
 import sys
 import time
 import uuid
@@ -22,7 +23,47 @@ import aiosqlite
 import pandas as pd
 import pandas_market_calendars as mcal
 import yfinance as yf
+import ssl
+import urllib.request
+
+import certifi
+
 from ib_insync import IB, FlexReport, MarketOrder, Stock, util
+from ib_insync.decoder import Decoder
+from ib_insync.wrapper import Wrapper
+
+# ── SSL 证书修复：Python 3.14 在 macOS 上缺少系统根证书，导致 Flex 查询失败 ──
+_ssl_context = ssl.create_default_context(cafile=certifi.where())
+_https_handler = urllib.request.HTTPSHandler(context=_ssl_context)
+urllib.request.install_opener(urllib.request.build_opener(_https_handler))
+
+# ── Monkey-patch #1: ib_insync 0.9.86 不兼容 TWS 10.48+ 的新消息类型 ──
+_original_interpret = Decoder.interpret
+
+
+def _patched_interpret(self, fields):
+    try:
+        msgId = int(fields[0])
+        if msgId not in self.handlers:
+            return
+        self.handlers[msgId](fields)
+    except Exception:
+        self.logger.exception("Error handling fields: %s", fields)
+
+
+Decoder.interpret = _patched_interpret
+
+# ── Monkey-patch #2: completedOrder handler 未安全初始化 _results key ──
+_original_completedOrder = Wrapper.completedOrder
+
+
+def _safe_completedOrder(self, contract, order, orderState):
+    if "completedOrders" not in self._results:
+        self._results["completedOrders"] = []
+    return _original_completedOrder(self, contract, order, orderState)
+
+
+Wrapper.completedOrder = _safe_completedOrder
 from telegram import (
     Bot,
     BotCommand,
@@ -65,7 +106,8 @@ from database import (
     get_today_trade_count,
 )
 from market_regime import REGIME_OFFLINE_LABEL, fetch_market_regime
-from notion_api import check_notion_online, push_to_notion
+from notion_api import check_notion_online, enqueue_notion, push_to_notion
+from outbound_queue import enqueue_outbound, outbound_worker
 
 
 class RiskManagerApp:
@@ -78,6 +120,10 @@ class RiskManagerApp:
         self.tws_online_notified: bool = False
         self.symbol_locks: dict[str, asyncio.Lock] = {}
         self.killing_symbols: set[str] = set()
+        self._debounce_tasks: dict[str, asyncio.Task] = {}  # 防抖：symbol → timer task
+        self._debounce_msgs: dict[str, list[str]] = {}       # 防抖：symbol → pending messages
+        self._nightwatchman_done: set[str] = set()           # 守夜人已执行标的
+        self._last_synced: dict[str, dict] = {}              # 同步守护：symbol → {qty, stop, entry}
         self.system_status_cache = {
             "order_tool_running": False,
             "notion_online": False,
@@ -97,6 +143,34 @@ class RiskManagerApp:
         task.add_done_callback(self.background_tasks.discard)
         return task
 
+    def debounced_notify(self, symbol: str, msg: str, delay: float = 3.0):
+        """防抖通知：同一标的 3 秒内的多条消息合并为一条。"""
+        if symbol not in self._debounce_msgs:
+            self._debounce_msgs[symbol] = []
+        self._debounce_msgs[symbol].append(msg)
+        old = self._debounce_tasks.pop(symbol, None)
+        if old and not old.done():
+            old.cancel()
+        async def _fire():
+            await asyncio.sleep(delay)
+            msgs = self._debounce_msgs.pop(symbol, [])
+            self._debounce_tasks.pop(symbol, None)
+            if not msgs:
+                return
+            unique = list(dict.fromkeys(msgs))
+            if len(unique) == 1:
+                text = unique[0]
+            else:
+                text = f"📊 **{symbol} 成交汇总** ({len(msgs)}笔)\n\n" + "\n".join(f"  • {m}" for m in unique[:5])
+                if len(unique) > 5:
+                    text += f"\n  ... 共 {len(unique)} 条"
+            if self.bot:
+                try:
+                    await self.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=text)
+                except Exception:
+                    pass
+        self._debounce_tasks[symbol] = asyncio.create_task(_fire())
+
     def set_components(self, gateway, ib_listener, risk_engine):
         self.gateway = gateway
         self.ib_listener = ib_listener
@@ -110,7 +184,79 @@ class RiskManagerApp:
         self.spawn_background_task(self.heartbeat_2300_daemon())
         self.spawn_background_task(self.active_position_monitor_daemon())
         self.spawn_background_task(self.check_corporate_actions_job())
-        self.spawn_background_task(self.sync_flex_query_job())
+        self.spawn_background_task(outbound_worker(self))
+        self.spawn_background_task(self.sync_daemon())
+
+    async def sync_daemon(self):
+        """每分钟同步：TWS 仓位/止损 → DB → Telegram + Notion（增量推送，去重）。"""
+        await asyncio.sleep(10)  # 等启动流程完成
+        flex_tick = 0
+        while True:
+            try:
+                if not self.ib.isConnected():
+                    await asyncio.sleep(15)
+                    continue
+
+                # 拉取 TWS 仓位 + 挂单
+                try:
+                    positions = await asyncio.wait_for(self.ib.reqPositionsAsync(), timeout=10)
+                except Exception:
+                    await asyncio.sleep(15)
+                    continue
+
+                # 构建 TWS 现状
+                tws_state: dict[str, dict] = {}
+                for p in positions:
+                    if p.contract.secType != "STK" or p.position == 0:
+                        continue
+                    sym = p.contract.symbol
+                    tws_state[sym] = {
+                        "qty": abs(float(p.position)),
+                        "side": "LONG" if float(p.position) > 0 else "SHORT",
+                        "entry": float(p.avgCost),
+                        "stop": 0.0,
+                    }
+
+                # 查 TWS 止损单
+                for t in self.ib.openTrades():
+                    if t.order.orderType in ("STP", "STP LMT") and t.order.auxPrice > 0:
+                        sym = t.contract.symbol
+                        if sym in tws_state:
+                            tws_state[sym]["stop"] = float(t.order.auxPrice)
+
+                # Diff: 对比上次同步状态
+                changes = []
+                for sym, state in tws_state.items():
+                    prev = self._last_synced.get(sym, {})
+                    if (prev.get("qty") != state["qty"]
+                            or prev.get("stop") != state["stop"]
+                            or prev.get("entry") != state["entry"]):
+                        changes.append(sym)
+                        self._last_synced[sym] = state
+
+                # 检测被平仓（上次有，这次没了）
+                closed_syms = set(self._last_synced) - set(tws_state)
+                for sym in closed_syms:
+                    del self._last_synced[sym]
+
+                # 推送变更
+                if changes or closed_syms:
+                    print(f"🔄 同步守护: {len(changes)}个变更, {len(closed_syms)}个平仓")
+                    # 运行对账（自动导入 + 止损同步 + 进场价修正）
+                    try:
+                        await globals()["reconcile_physical_positions"](None)
+                    except Exception as e:
+                        print(f"同步对账失败: {e}")
+
+                # Flex: 每 5 分钟一次
+                flex_tick += 1
+                if flex_tick >= 5:
+                    flex_tick = 0
+                    self.spawn_background_task(self.sync_flex_query_job())
+
+            except Exception as e:
+                print(f"同步守护异常: {e}")
+            await asyncio.sleep(60)
 
     async def daily_rollover_daemon(self):
         tz = ZoneInfo(TRADING_TZ)
@@ -234,14 +380,17 @@ class RiskManagerApp:
         try:
             async with connect_db() as db:
                 db.row_factory = aiosqlite.Row
-                cursor = await db.execute("SELECT DISTINCT symbol FROM shadow_ledger WHERE status='OPEN'")
+                cursor = await db.execute(
+                    "SELECT symbol, MIN(create_time) as earliest FROM shadow_ledger "
+                    "WHERE status='OPEN' GROUP BY symbol"
+                )
                 rows = await cursor.fetchall()
-            symbols = [r["symbol"] for r in rows]
-            if not symbols:
+            if not rows:
                 return
+            symbol_earliest: dict[str, str] = {r["symbol"]: r["earliest"] for r in rows}
 
             loop = asyncio.get_running_loop()
-            for sym in symbols:
+            for sym, earliest_create in symbol_earliest.items():
                 try:
                     def fetch_data(ticker_str: str):
                         tkr = yf.Ticker(ticker_str)
@@ -254,17 +403,32 @@ class RiskManagerApp:
                             if ratio_f <= 0 or ratio_f == 1.0:
                                 continue
                             date_str = split_date.strftime("%Y-%m-%d")
+                            # ── 只处理仓位创建之后发生的拆股，避免历史拆股被重复执行 ──
+                            if date_str <= earliest_create[:10]:
+                                continue
                             async with connect_db() as db:
-                                cur = await db.execute("SELECT 1 FROM applied_splits WHERE symbol=? AND split_date=?", (sym, date_str))
+                                cur = await db.execute(
+                                    "SELECT 1 FROM applied_splits WHERE symbol=? AND split_date=?",
+                                    (sym, date_str),
+                                )
                                 if await cur.fetchone():
                                     continue
                                 await db.execute(
-                                    "UPDATE shadow_ledger SET quantity=quantity*?, entry_price=entry_price/?, initial_stop=initial_stop/?, current_stop=current_stop/? WHERE symbol=? AND status='OPEN'",
-                                    (ratio_f, ratio_f, ratio_f, ratio_f, sym)
+                                    "UPDATE shadow_ledger SET quantity=quantity*?, entry_price=entry_price/?, "
+                                    "initial_stop=initial_stop/?, current_stop=current_stop/? "
+                                    "WHERE symbol=? AND status='OPEN'",
+                                    (ratio_f, ratio_f, ratio_f, ratio_f, sym),
                                 )
-                                await db.execute("INSERT INTO applied_splits (symbol, split_date, ratio) VALUES (?, ?, ?)", (sym, date_str, ratio_f))
+                                await db.execute(
+                                    "INSERT INTO applied_splits (symbol, split_date, ratio) VALUES (?, ?, ?)",
+                                    (sym, date_str, ratio_f),
+                                )
                                 await db.commit()
-                            await self.gateway.notify_user(f"✂️ **自动化拆股执行**\n系统检测到 `{sym}` 在 {date_str} 执行了 1:{ratio_f:g} 拆股。\n影子账本已静默等比例折算！")
+                            await self.gateway.notify_user(
+                                f"✂️ **自动化拆股执行**\n"
+                                f"系统检测到 `{sym}` 在 {date_str} 执行了 1:{ratio_f:g} 拆股。\n"
+                                f"影子账本已静默等比例折算！"
+                            )
 
                     if last_price is None or pd.isna(last_price):
                         await self.gateway.notify_user(f"⚠️ **公司代码异常预警**\n系统无法从雅虎财经获取 `{sym}`。该股票可能已**更名或退市**。\n请用 `/rename {sym} [新代码]` 修正账本！")
@@ -285,7 +449,29 @@ class RiskManagerApp:
                 return
 
             loop = asyncio.get_running_loop()
-            report = await loop.run_in_executor(None, lambda: FlexReport(FLEX_TOKEN, FLEX_QUERY_ID))
+            # Flex 报表可能需要等待 IBKR 生成，最多重试 3 次（含 SSL/网络容错）
+            report = None
+            for flex_attempt in range(3):
+                try:
+                    report = await loop.run_in_executor(
+                        None, lambda: FlexReport(FLEX_TOKEN, FLEX_QUERY_ID)
+                    )
+                    break
+                except Exception as fe:
+                    err_msg = str(fe)
+                    retryable = any(kw in err_msg.lower() for kw in (
+                        "1001", "could not be generated", "ssl", "eof",
+                        "timeout", "connection",
+                    ))
+                    if retryable:
+                        wait = 15 * (flex_attempt + 1)
+                        print(f"Flex 报表 {err_msg[:60]}... {wait}s 后重试 ({flex_attempt + 1}/3)")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+            if report is None:
+                print("Flex 报表多次尝试未就绪，已跳过本次对账。")
+                return
 
             async with connect_db() as db_connection:
                 db_connection.row_factory = aiosqlite.Row
@@ -302,7 +488,11 @@ class RiskManagerApp:
                     if row:
                         trade_id, setup_tag = row["id"], row["setup_tag"] or ""
                         await db_connection.execute("UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?", (exec_price, realized_pnl, trade_id))
-                        self.spawn_background_task(push_to_notion(trade_id, symbol, realized_pnl, setup_tag))
+                        await enqueue_outbound(
+                            f"{trade_id}-CLOSE", "notion",
+                            {"trade_id": trade_id, "symbol": symbol, "event_type": "CLOSE",
+                             "realized_pnl": realized_pnl, "setup_tag": setup_tag or ""},
+                        )
                         closed += 1
                         total_pnl += realized_pnl
                         closed_symbols.append(symbol)
@@ -310,7 +500,10 @@ class RiskManagerApp:
 
             if closed > 0:
                 pnl_str = f"+${total_pnl:.2f}" if total_pnl > 0 else f"-${abs(total_pnl):.2f}"
-                await self.gateway.notify_user(f"✅ **盘前静默清算完成**\n成功关闭 {closed} 笔仓位：{', '.join(closed_symbols)}\n合计盈亏: {pnl_str}\n数据已归档。")
+                await enqueue_outbound(
+                    f"flex-close-{datetime.date.today().isoformat()}", "telegram",
+                    {"message": f"✅ **盘前静默清算完成**\n成功关闭 {closed} 笔仓位：{', '.join(closed_symbols)}\n合计盈亏: {pnl_str}\n数据已归档。"},
+                )
         except Exception as e:
             print(f"🚨 Flex 对账失败: {e}")
 
@@ -354,6 +547,8 @@ class RiskManagerApp:
 class TelegramGateway:
     def __init__(self, context: RiskManagerApp):
         self.ctx = context
+        self._msg_queue: list[str] = []      # 断网消息队列
+        self._tg_was_offline: bool = False
 
     def bind_bot(self, bot: Bot) -> None:
         self.ctx.bot = bot
@@ -364,9 +559,43 @@ class TelegramGateway:
             print(f"TG 未绑定，跳过通知: {text[:80]}...")
             return
         try:
+            # 先尝试排空积压队列
+            if self._msg_queue:
+                await self._drain_queue()
             await self.ctx.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=text, reply_markup=reply_markup)
+            if self._tg_was_offline:
+                self._tg_was_offline = False
+                await self.ctx.bot.send_message(
+                    chat_id=MY_TELEGRAM_CHAT_ID, text="📶 **Telegram 已恢复连接** — 断网期间通知已补发完毕。"
+                )
         except Exception as e:
-            print(f"TG 发送失败: {e}")
+            self._tg_was_offline = True
+            # 入队：去重 + 限制队列长度
+            if text not in self._msg_queue:
+                self._msg_queue.append(text)
+                if len(self._msg_queue) > 50:
+                    self._msg_queue = self._msg_queue[-30:]  # 保留最近 30 条
+            print(f"TG 发送失败（已入队 {len(self._msg_queue)} 条）: {e}")
+
+    async def _drain_queue(self) -> None:
+        """Telegram 恢复时批量推送积压消息。"""
+        if not self._msg_queue or self.ctx.bot is None:
+            return
+        queue = self._msg_queue
+        self._msg_queue = []
+        delivered = 0
+        for i, msg in enumerate(queue):
+            try:
+                await self.ctx.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=msg)
+                delivered += 1
+                await asyncio.sleep(0.5)  # 避免轰炸
+            except Exception as e:
+                # 重新入队剩余消息
+                self._msg_queue = queue[i:]
+                print(f"补发中断 ({delivered}/{len(queue)}): {e}")
+                raise
+        if delivered > 0:
+            print(f"✅ 断网补发完成: {delivered} 条")
 
     def format_bot_uptime(self) -> str:
         if self.ctx.bot_started_at is None:
@@ -416,16 +645,24 @@ class IBKRListener:
             return True
         preferred, fallback, mode_cn = resolve_tws_ports()
         for port in (preferred, fallback):
-            try:
-                await self.ib.connectAsync(TWS_HOST, port, clientId=CLIENT_ID, timeout=5)
-                self.ctx.active_tws_port = port
-                used_fallback = port != preferred
-                suffix = " (备用端口)" if used_fallback else ""
-                print(f"✅ TWS 已连接：{mode_cn} {TWS_HOST}:{port}{suffix} (clientId={CLIENT_ID})")
-                self._register_event_handlers()
-                return True
-            except Exception as e:
-                print(f"TWS {TWS_HOST}:{port} 连接失败: {e}")
+            for attempt in range(5):
+                try:
+                    await self.ib.connectAsync(TWS_HOST, port, clientId=CLIENT_ID, timeout=15)
+                    self.ctx.active_tws_port = port
+                    used_fallback = port != preferred
+                    suffix = " (备用端口)" if used_fallback else ""
+                    print(f"✅ TWS 已连接：{mode_cn} {TWS_HOST}:{port}{suffix} (clientId={CLIENT_ID})")
+                    self._register_event_handlers()
+                    return True
+                except Exception as e:
+                    err_msg = str(e)
+                    if "already in use" in err_msg.lower() or "已被使用" in err_msg:
+                        wait = 60
+                        print(f"TWS {TWS_HOST}:{port} Client ID 被占用，{wait}s 后重试 ({attempt + 1}/5)...")
+                    else:
+                        wait = 10
+                        print(f"TWS {TWS_HOST}:{port} 连接失败({type(e).__name__})，{wait}s 后重试 ({attempt + 1}/5)")
+                    await asyncio.sleep(wait)
         self.ctx.active_tws_port = None
         return False
 
@@ -461,7 +698,17 @@ class IBKRListener:
                             )
             except Exception as e:
                 print(f"🚨 IB 探活守护进程异常: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
+
+    async def _on_tws_reconnect(self):
+        """TWS 恢复连接后自动补齐：仓位对账 + Flex 交易记录 + 止损同步。"""
+        print("🔄 TWS 重连：开始自动补齐...")
+        await asyncio.sleep(2)
+        try:
+            await globals()["reconcile_physical_positions"](None)
+        except Exception as e:
+            print(f"重连对账失败: {e}")
+        self.ctx.spawn_background_task(self.ctx.sync_flex_query_job())
 
     async def fetch_entry_price(self, symbol: str):
         if not await self.ensure_connected():
@@ -555,7 +802,7 @@ class IBKRListener:
                                 stop_for_val = float(open_trade.order.auxPrice)
                                 break
                     equity = await self.fetch_account_equity()
-                    reject_reason = await validate_pending_entry(
+                    reject_reason = await self.ctx.risk_engine.validate_pending_entry(
                         conn, price, stop_for_val, qty, equity, is_buy=(side == "LONG")
                     )
                     if reject_reason:
@@ -612,24 +859,32 @@ class IBKRListener:
                             f"新增: {qty:.0f}股 @ ${price:.2f} (均价拉至 ${new_entry:.2f})\n"
                             f"策略: {merged_tag or '未打标'}\n{stop_msg}"
                         )
-                        self.ctx.spawn_background_task(self.gateway.notify_user(msg))
+                        await enqueue_outbound(
+                            f"{same_day_row['id']}-ADD", "telegram",
+                            {"message": msg},
+                        )
                     else:
                         tranche_id = f"T{len(open_tranches) + 1}"
-                        await conn.execute(
+                        cursor = await conn.execute(
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
                             "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
                             (symbol, tranche_id, side, qty, price, setup_tag),
                         )
+                        new_trade_id = cursor.lastrowid
                         await conn.commit()
-                        msg = (
-                            f"🎯 **前端火力捕获 (新开仓)**\n"
-                            f"已接管来自 UI 的开仓指令：`{symbol}`\n"
-                            f"成交: {qty:.0f}股 @ ${price:.2f}\n"
-                            f"策略: {setup_tag or '未打标'}\n*(止损线将在 2 秒内自动同步防线)*"
+                        await enqueue_outbound(
+                            f"{new_trade_id}-OPEN", "telegram",
+                            {"message": (
+                                f"🎯 **前端火力捕获 (新开仓)**\n"
+                                f"已接管来自 UI 的开仓指令：`{symbol}`\n"
+                                f"成交: {qty:.0f}股 @ ${price:.2f}\n"
+                                f"策略: {setup_tag or '未打标'}\n*(止损线将在 3 秒内自动同步防线)*"
+                            )},
                         )
-                        self.ctx.spawn_background_task(self.gateway.notify_user(msg))
-                        self.ctx.spawn_background_task(self._delayed_bracket_stop_capture(symbol))
+                        self.ctx.spawn_background_task(
+                            self._delayed_bracket_stop_capture(symbol, new_trade_id)
+                        )
                 else:
                     had_profit = False
                     had_loss = False
@@ -645,12 +900,35 @@ class IBKRListener:
                             cursor = await conn.execute("SELECT setup_tag FROM shadow_ledger WHERE id=?", (t_id,))
                             tag_row = await cursor.fetchone()
                             s_tag = tag_row["setup_tag"] if tag_row and tag_row["setup_tag"] else ""
-                            if (tranche_side == "LONG" and price < t_entry) or (tranche_side == "SHORT" and price > t_entry):
+                            # 计算实际盈亏
+                            if tranche_side == "LONG":
+                                actual_pnl = (price - t_entry) * t_qty
+                            else:
+                                actual_pnl = (t_entry - price) * t_qty
+                            if actual_pnl < 0:
                                 had_loss = True
-                            elif (tranche_side == "LONG" and price > t_entry) or (tranche_side == "SHORT" and price < t_entry):
+                            elif actual_pnl > 0:
                                 had_profit = True
-                            await conn.execute("UPDATE shadow_ledger SET status='CLOSED', exit_price=? WHERE id=?", (price, t_id))
-                            self.ctx.spawn_background_task(push_to_notion(t_id, symbol, 0.0, s_tag))
+                            await conn.execute(
+                                "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
+                                (price, actual_pnl, t_id),
+                            )
+                            pnl_sign = "+" if actual_pnl > 0 else ""
+                            close_msg = (
+                                f"📤 **平仓确认** `{symbol}`\n"
+                                f"{tranche_side} {t_qty:.0f}股 @ ${price:.2f} | "
+                                f"盈亏 {pnl_sign}${actual_pnl:.2f}"
+                            )
+                            await enqueue_outbound(f"{t_id}-CLOSE", "telegram", {"message": close_msg})
+                            await enqueue_outbound(
+                                f"{t_id}-CLOSE", "notion",
+                                {
+                                    "trade_id": t_id, "symbol": symbol, "event_type": "CLOSE",
+                                    "side": tranche_side, "quantity": t_qty,
+                                    "entry_price": t_entry, "exit_price": price,
+                                    "realized_pnl": actual_pnl, "setup_tag": s_tag or "",
+                                },
+                            )
                             remaining_exit_qty -= t_qty
                         else:
                             new_qty = t_qty - remaining_exit_qty
@@ -670,7 +948,9 @@ class IBKRListener:
                                     f"系统已自动将剩余 {new_qty:.0f} 股止损推至成本价 ${t_entry:.2f}。\n"
                                     f"🛡️ **该笔交易风控额度已完全释放！**"
                                 )
-                                self.ctx.spawn_background_task(self.gateway.notify_user(msg))
+                                await enqueue_outbound(
+                                    f"{t_id}-PARTIAL_CLOSE", "telegram", {"message": msg},
+                                )
                             else:
                                 if (tranche_side == "LONG" and price < t_entry) or (tranche_side == "SHORT" and price > t_entry):
                                     had_loss = True
@@ -681,35 +961,85 @@ class IBKRListener:
                 await conn.commit()
 
             if not opening:
-                self.ctx.spawn_background_task(_night_watchman_on_tp(trade, execution))
-
-    async def _delayed_bracket_stop_capture(self, symbol: str):
-        await asyncio.sleep(2.0)
-        if not self.ib.isConnected():
-            return
-        try:
-            found_stop = None
-            for open_trade in self.ib.openTrades():
-                if (open_trade.contract.symbol == symbol and open_trade.order.orderType in ("STP", "STP LMT")):
-                    found_stop = float(open_trade.order.auxPrice)
-                    break
-            if not found_stop or found_stop <= 0:
-                return
-            async with connect_db() as conn:
-                cursor = await conn.execute(
-                    """
-                    UPDATE shadow_ledger
-                    SET current_stop=?, initial_stop=?
-                    WHERE symbol=? AND status='OPEN' AND initial_stop=0.0
-                    """,
-                    (found_stop, found_stop, symbol),
+                self.ctx.spawn_background_task(
+                    self.ctx.risk_engine.night_watchman_on_tp(trade, execution)
                 )
-                if cursor.rowcount > 0:
-                    await conn.commit()
-                    msg = f"🛡️ **防线主动同步完毕：** `{symbol}` 的底层止损已被锚定在 ${found_stop:.2f}。"
-                    await self.gateway.notify_user(msg)
+
+    async def _delayed_bracket_stop_capture(self, symbol: str, trade_id: int = 0):
+        """开仓后 3s 捕获 TWS 自动生成的 bracket 止损单，然后一次性写 Notion。"""
+        await asyncio.sleep(3.0)
+        try:
+            found_stop = 0.0
+            if self.ib.isConnected():
+                for open_trade in self.ib.openTrades():
+                    if (open_trade.contract.symbol == symbol
+                            and open_trade.order.orderType in ("STP", "STP LMT")):
+                        found_stop = float(open_trade.order.auxPrice)
+                        break
+
+            # 读取 SPY 市场环境
+            spy_ctx = ""
+            try:
+                from market_regime import fetch_market_regime
+                label, _, _ = await fetch_market_regime()
+                spy_ctx = label if label else ""
+            except Exception:
+                pass
+
+            async with connect_db() as conn:
+                conn.row_factory = aiosqlite.Row
+
+                # 更新止损到数据库
+                if found_stop > 0:
+                    cursor = await conn.execute(
+                        "UPDATE shadow_ledger SET current_stop=?, initial_stop=? "
+                        "WHERE symbol=? AND status='OPEN' AND initial_stop=0.0",
+                        (found_stop, found_stop, symbol),
+                    )
+                    if cursor.rowcount > 0:
+                        await conn.commit()
+                        msg = f"🛡️ **防线主动同步完毕：** `{symbol}` 的底层止损已被锚定在 ${found_stop:.2f}。"
+                        await enqueue_outbound(
+                            f"{trade_id}-STOP_SYNCED-{found_stop:.0f}",
+                            "telegram", {"message": msg},
+                        )
+
+                # 一次性写入 Notion（含止损 + SPY Context）
+                tid = trade_id
+                if tid <= 0:
+                    cur2 = await conn.execute(
+                        "SELECT id FROM shadow_ledger "
+                        "WHERE symbol=? AND status='OPEN' ORDER BY create_time DESC LIMIT 1",
+                        (symbol,),
+                    )
+                    row = await cur2.fetchone()
+                    if row:
+                        tid = row["id"]
+
+                if tid > 0:
+                    cur3 = await conn.execute(
+                        "SELECT side, quantity, entry_price, setup_tag, create_time "
+                        "FROM shadow_ledger WHERE id=?",
+                        (tid,),
+                    )
+                    pos_row = await cur3.fetchone()
+                    if pos_row:
+                        db_stop = found_stop if found_stop > 0 else 0.0
+                        await enqueue_outbound(
+                            f"{tid}-OPEN", "notion",
+                            {
+                                "trade_id": tid, "symbol": symbol, "event_type": "OPEN",
+                                "side": pos_row["side"],
+                                "quantity": float(pos_row["quantity"]),
+                                "entry_price": float(pos_row["entry_price"]),
+                                "initial_stop": db_stop, "current_stop": db_stop,
+                                "setup_tag": pos_row["setup_tag"] or "",
+                                "create_time": pos_row["create_time"] or "",
+                                "spy_context": spy_ctx,
+                            },
+                        )
         except Exception as e:
-            print(f"延迟捕获止损出错: {e}")
+            print(f"延迟捕获止损/Notion同步出错: {e}")
 
     def on_open_order(self, trade):
         self._dispatch_async(self._async_on_open_order(trade))
@@ -909,6 +1239,11 @@ class RiskEngine:
             return
 
         symbol = trade.contract.symbol
+        # ── 防抖：同一标的只执行一次 ──
+        if symbol in self.ctx._nightwatchman_done:
+            return
+        self.ctx._nightwatchman_done.add(symbol)
+
         try:
             async with connect_db() as conn:
                 conn.row_factory = aiosqlite.Row
@@ -935,14 +1270,10 @@ class RiskEngine:
                     if (stop_order.action or "").upper() == "SELL":
                         stop_order.auxPrice = entry_price
                         need_modify = True
-                    else:
-                        print(f"⚠️ [守夜人漏改] {symbol} 多头: 找到的止损单 action 为 '{stop_order.action}'，预期为 'SELL'")
                 elif pos_side == "SHORT" and old_stop > entry_price:
                     if (stop_order.action or "").upper() == "BUY":
                         stop_order.auxPrice = entry_price
                         need_modify = True
-                    else:
-                        print(f"⚠️ [守夜人漏改] {symbol} 空头: 找到的止损单 action 为 '{stop_order.action}'，预期为 'BUY'")
                 if not need_modify:
                     continue
                 self.ib_listener.ib.placeOrder(open_trade.contract, stop_order)
@@ -952,11 +1283,14 @@ class RiskEngine:
                         (entry_price, symbol),
                     )
                     await conn.commit()
-                await self.gateway.notify_user(
-                    f"🛡️ **守夜人协议触发**\n"
-                    f"`{symbol}` 的分批止盈单已成交！\n"
-                    f"后台已将剩余仓位的止损单推移至保本价 ${entry_price:.2f}。\n"
-                    f"您可以安心睡觉了。"
+                await enqueue_outbound(
+                    f"{trade_id}-STOP_BREAKEVEN", "telegram",
+                    {"message": (
+                        f"🛡️ **守夜人协议触发**\n"
+                        f"`{symbol}` 的分批止盈单已成交！\n"
+                        f"后台已将剩余仓位的止损单推移至保本价 ${entry_price:.2f}。\n"
+                        f"您可以安心睡觉了。"
+                    )},
                 )
                 break
         except Exception as e:
@@ -1008,6 +1342,15 @@ def _spawn_background_task(coro) -> asyncio.Task:
     return app.spawn_background_task(coro)
 
 
+async def _enqueue_both(event_key: str, telegram_msg: str = "", notion_data: dict | None = None):
+    """便捷：同时入队 Telegram + Notion 通道。"""
+    if telegram_msg:
+        await enqueue_outbound(event_key, "telegram", {"message": telegram_msg})
+    if notion_data:
+        notion_data["event_type"] = notion_data.get("event_type", event_key.split("-", 1)[1] if "-" in event_key else "UPDATE")
+        await enqueue_outbound(event_key, "notion", notion_data)
+
+
 def build_service_status_lines() -> list[str]:
     return tg_gateway.build_service_status_lines()
 
@@ -1020,6 +1363,28 @@ async def _notify_user(text: str) -> None:
     await tg_gateway.notify_user(text)
 
 
+async def _notify_system_online(reason: str = "启动") -> None:
+    """TWS 连上且监听就绪后，向 Telegram 推送一次上线通知。"""
+    if not app.ib.isConnected() or app.tws_online_notified:
+        return
+    app.tws_online_notified = True
+    status = "\n".join(build_service_status_lines()).strip()
+    await _notify_user(
+        f"🟢 **风控军师系统已上线** ({reason})\n\n"
+        f"{status}\n\n"
+        f"👀 成交监听已挂载，桌面端下单成交后将自动入账。"
+    )
+
+
+async def _notify_bot_only_online() -> None:
+    """Bot 已启动但 TWS 未连时的一次性提示。"""
+    await _notify_user(
+        "🟡 **军师 Bot 已启动，TWS 未连接**\n"
+        "Telegram 指令可用，但成交监听暂不可用。\n"
+        "请确认 TWS 已登录且 API 已开启，连上后会再推送上线通知。"
+    )
+
+
 async def ensure_ib_connected() -> bool:
     return await ib_listener.ensure_connected()
 
@@ -1030,6 +1395,22 @@ async def fetch_entry_price(symbol: str):
 
 async def fetch_account_equity() -> float:
     return await ib_listener.fetch_account_equity()
+
+
+async def calculate_risk_light(conn, equity: float):
+    return await risk_engine.calculate_risk_light(conn, equity)
+
+
+async def validate_pending_entry(conn, entry_price, stop_price, quantity, equity, is_buy):
+    return await risk_engine.validate_pending_entry(conn, entry_price, stop_price, quantity, equity, is_buy)
+
+
+async def execute_kill_switch(symbol: str, trigger_reason: str = "手动授权") -> str:
+    return await risk_engine.execute_kill_switch(symbol, trigger_reason)
+
+
+async def get_10ema(symbol: str) -> float:
+    return await risk_engine.get_10ema(symbol)
 
 
 def calc_share_quantity(risk_budget: float, entry_price: float, stop_price: float) -> int:
@@ -1102,7 +1483,10 @@ async def reconcile_physical_positions(tg_application):
         return
 
     try:
-        positions = await ib.reqPositionsAsync()
+        positions = await asyncio.wait_for(ib.reqPositionsAsync(), timeout=15)
+    except asyncio.TimeoutError:
+        print("⚠️ 物理持仓拉取超时 (15s)，跳过对账。")
+        return
     except Exception as e:
         print(f"❌ 物理持仓拉取失败: {e}")
         return
@@ -1152,24 +1536,145 @@ async def reconcile_physical_positions(tg_application):
                 )
                 await _close_ledger_discrepancy(conn, sym, discrepancy)
             else:
-                ghost_alerts.append(
-                    f"⚠️ **发现未授权物理仓位 [{sym}]**\n"
-                    f"账本预期: {_fmt_signed_position(expected)} | "
-                    f"TWS实际: {_fmt_signed_position(actual)}\n"
-                    f"*(请立刻使用 /init 或 /override 录入系统！)*"
+                # ── 自动导入：TWS 有新仓位但账本没有 ──
+                auto_imported = []
+                for pos in positions:
+                    if pos.contract.symbol == sym and pos.contract.secType == "STK" and pos.position != 0:
+                        raw_qty = float(pos.position)
+                        auto_side = "LONG" if raw_qty > 0 else "SHORT"
+                        auto_qty = abs(raw_qty)
+                        auto_entry = float(pos.avgCost)
+                        if auto_entry <= 0:
+                            continue
+                        tranche_id = f"T{await count_open_tranches(conn, sym) + 1}"
+                        await conn.execute(
+                            "INSERT INTO shadow_ledger "
+                            "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'IMPORT')",
+                            (sym, tranche_id, auto_side, auto_qty, auto_entry),
+                        )
+                        auto_imported.append(
+                            f"📥 {auto_side} {sym} {auto_qty:.0f}股 @ ${auto_entry:.2f}（自动收编）"
+                        )
+                ghost_alerts.extend(auto_imported)
+
+        # ── 同步 TWS 进场价到 IMPORT 仓位（修正拆股等导致的价格漂移）──
+        price_fix_log: list[str] = []
+        for pos in positions:
+            if pos.position == 0 or pos.contract.secType != "STK":
+                continue
+            sym = pos.contract.symbol
+            tws_avg = float(pos.avgCost)
+            if tws_avg <= 0:
+                continue
+            cursor = await conn.execute(
+                "SELECT id, entry_price, setup_tag FROM shadow_ledger "
+                "WHERE symbol=? AND status='OPEN'",
+                (sym,),
+            )
+            db_rows = await cursor.fetchall()
+            for db_row in db_rows:
+                db_entry = float(db_row["entry_price"])
+                tag = db_row["setup_tag"] or ""
+                if abs(tws_avg - db_entry) / max(tws_avg, 0.01) > 0.01:
+                    if "IMPORT" in tag:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET entry_price=? WHERE id=?",
+                            (tws_avg, db_row["id"]),
+                        )
+                        price_fix_log.append(
+                            f"📐 {sym} 进场价已修正: ${db_entry:.2f} → ${tws_avg:.2f}"
+                        )
+                    else:
+                        price_fix_log.append(
+                            f"⚠️ {sym} 进场价偏差: 账本 ${db_entry:.2f} vs TWS ${tws_avg:.2f}（非 IMPORT，未自动修正）"
+                        )
+
+        # ── 同步 TWS 止损单到影子账本 ──
+        stop_sync_log: list[str] = []
+        try:
+            open_trades = ib.openTrades()
+            for trade in open_trades:
+                o = trade.order
+                if o.orderType not in ("STP", "STP LMT", "TRAIL", "TRAIL LIMIT"):
+                    continue
+                if trade.orderStatus.status not in ("PreSubmitted", "Submitted"):
+                    continue
+                sym = trade.contract.symbol
+                stop_price = float(o.auxPrice) if o.auxPrice > 0 else float(o.lmtPrice)
+                if stop_price <= 0:
+                    continue
+
+                cursor = await conn.execute(
+                    "SELECT id, side, quantity, entry_price, initial_stop, current_stop "
+                    "FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
+                    (sym,),
                 )
+                open_rows = await cursor.fetchall()
+                if not open_rows:
+                    continue
+
+                for row in open_rows:
+                    side = row["side"]
+                    entry = float(row["entry_price"])
+                    old_init = float(row["initial_stop"])
+                    # ── 方向校验：LONG 止损应在进场下方，SHORT 止损应在进场上方 ──
+                    if side == "LONG" and stop_price > entry:
+                        stop_sync_log.append(
+                            f"⚠️ {sym} 止损 ${stop_price:.2f} > 进场 ${entry:.2f}（LONG），疑似止盈单，已跳过"
+                        )
+                        continue
+                    if side == "SHORT" and stop_price < entry:
+                        stop_sync_log.append(
+                            f"⚠️ {sym} 止损 ${stop_price:.2f} < 进场 ${entry:.2f}（SHORT），疑似止盈单，已跳过"
+                        )
+                        continue
+                    new_init = stop_price if old_init == 0.0 else old_init
+                    if float(row["current_stop"]) != stop_price or old_init != new_init:
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET current_stop=?, initial_stop=? WHERE id=?",
+                            (stop_price, new_init, row["id"]),
+                        )
+                        stop_sync_log.append(
+                            f"🛡️ {sym} 止损已同步: "
+                            + (f"${stop_price:.2f} (新增防线)" if old_init == 0.0 else f"${stop_price:.2f}")
+                        )
+                        # 入队 Notion 更新止损 + Risk Amount
+                        _spawn_background_task(
+                            enqueue_notion(
+                                row["id"], sym, "OPEN",
+                                side=row["side"],
+                                quantity=float(row["quantity"]),
+                                entry_price=float(row["entry_price"]),
+                                initial_stop=new_init, current_stop=stop_price,
+                            )
+                        )
+        except Exception as e:
+            print(f"⚠️ 止损单同步失败: {e}")
 
         await conn.commit()
 
-        if ghost_alerts:
-            alert_msg = "🚨 **物理对账警告 (已处理)** 🚨\n\n" + "\n\n".join(ghost_alerts)
-            print("🚨 发生对账不一致，已发送 Telegram 警报。")
-            await tg_application.bot.send_message(
-                chat_id=MY_TELEGRAM_CHAT_ID,
-                text=alert_msg,
-            )
+        # ── 汇总通知 ──
+        if ghost_alerts or stop_sync_log or price_fix_log:
+            parts: list[str] = []
+            if ghost_alerts:
+                parts.append("🚨 **物理对账警告 (已处理)** 🚨\n\n" + "\n\n".join(ghost_alerts))
+            if price_fix_log:
+                parts.append("📐 **进场价自动修正**\n\n" + "\n".join(price_fix_log))
+            if stop_sync_log:
+                parts.append("🛡️ **TWS 止损单同步**\n\n" + "\n".join(stop_sync_log))
+            alert_msg = "\n\n".join(parts)
+            print(alert_msg)
+            if tg_application is not None:
+                try:
+                    await tg_application.bot.send_message(
+                        chat_id=MY_TELEGRAM_CHAT_ID,
+                        text=alert_msg,
+                    )
+                except Exception as e:
+                    print(f"⚠️ 对账通知发送失败: {e}")
         else:
-            print("✅ 物理仓位与影子账本 100% 吻合，防线坚固。")
+            print("✅ 物理仓位与影子账本 100% 吻合，进场价、止损单均已同步。")
 
 
 async def eod_10ema_sniper_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1480,11 +1985,20 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for r in rows:
                     stop = float(r["current_stop"])
                     initial = float(r["initial_stop"])
+                    entry = float(r["entry_price"])
+                    side = r["side"]
                     naked = stop == 0.0 and initial == 0.0
-                    warn = " ⚠️ [危险: 无止损(裸奔)]" if naked else ""
+                    # 方向校验
+                    stop_inverted = (side == "LONG" and stop > entry) or (side == "SHORT" and stop < entry)
+                    if naked:
+                        warn = " ⚠️ [危险: 无止损(裸奔)]"
+                    elif stop_inverted:
+                        warn = " ⚠️ [止损方向异常: 疑似止盈单]"
+                    else:
+                        warn = ""
                     lines.append(
-                        f"  • {r['side']} {r['symbol']} {r['tranche_id']} "
-                        f"{r['quantity']:.0f}股 @ {r['entry_price']:.2f} "
+                        f"  • {side} {r['symbol']} {r['tranche_id']} "
+                        f"{r['quantity']:.0f}股 @ {entry:.2f} "
                         f"stop {stop:.2f} [{r['setup_tag'] or ' '}]{warn}"
                     )
 
@@ -1782,8 +2296,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pending["spy_context"] or "",
             )
             await delete_pending_intent(conn, intent_id)
-            _spawn_background_task(
-                push_to_notion(row_id, pending["symbol"], 0.0, pending["setup_tag"])
+            # 读取 SPY 环境
+            spy_ctx = ""
+            try:
+                from market_regime import fetch_market_regime
+                label, _, _ = await fetch_market_regime()
+                spy_ctx = label if label else ""
+            except Exception:
+                pass
+            await enqueue_outbound(
+                f"{row_id}-OPEN", "telegram",
+                {"message": (
+                    f"🎯 **/init 开仓确认** `{pending['symbol']}`\n"
+                    f"LONG {float(pending['quantity']):.0f}股 @ ${float(pending['entry_price']):.2f}\n"
+                    f"止损: ${float(pending['stop_price']):.2f} | 策略: {pending['setup_tag']}"
+                )},
+            )
+            await enqueue_outbound(
+                f"{row_id}-OPEN", "notion",
+                {
+                    "trade_id": row_id, "symbol": pending["symbol"], "event_type": "OPEN",
+                    "side": "LONG", "quantity": float(pending["quantity"]),
+                    "entry_price": float(pending["entry_price"]),
+                    "initial_stop": float(pending["stop_price"]),
+                    "current_stop": float(pending["stop_price"]),
+                    "setup_tag": pending["setup_tag"], "spy_context": spy_ctx,
+                },
             )
 
             await query.edit_message_text(
@@ -1834,8 +2372,14 @@ async def cmd_override(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.commit()
 
             for row in rows:
-                _spawn_background_task(
-                    push_to_notion(row["id"], symbol, 0.0, "FOMO", confession=reason)
+                await enqueue_outbound(
+                    f"{row['id']}-OVERRIDE", "telegram",
+                    {"message": f"⚠️ **越权坦白** `{symbol}`\n理由: {reason}\n已自动设置 10% 止损线。"},
+                )
+                await enqueue_outbound(
+                    f"{row['id']}-OVERRIDE", "notion",
+                    {"trade_id": row["id"], "symbol": symbol, "event_type": "OVERRIDE",
+                     "setup_tag": "FOMO", "confession": reason},
                 )
 
         await update.effective_message.reply_text(
@@ -1976,22 +2520,42 @@ async def _apply_consecutive_losses(conn, profitable: bool, losing: bool) -> Non
         )
 
 
-async def _post_init(tg_app: Application) -> None:
-    bind_tg_bot(tg_app.bot)
+async def _pre_init_core() -> None:
+    """阶段 0：初始化不依赖 Telegram 的核心组件（TWS / DB / 守护进程）。"""
     await ensure_schema()
+    # ⚠️ 必须先连 TWS，再启动守护进程，避免 keepalive 并发抢占 clientId 0
+    tws_ok = await ensure_ib_connected()
+    app.initialize_background_tasks()
+    if tws_ok:
+        print("✅ TWS 已连接，主客户端(Master Client)全局跨端监听已启动。")
+        await asyncio.sleep(1)
+        # ① 先拉 IBKR 交易记录，关闭已平仓的账本条目
+        await app.sync_flex_query_job()
+        # ② 再对账：此时账本已反映最新成交，与 TWS 物理仓位对比
+        await reconcile_physical_positions(None)
+    else:
+        print("⚠️ TWS 未连接，/init 报价与成交同步将不可用。")
+
+
+async def _post_init_telegram(tg_app: Application) -> None:
+    """阶段 1：Telegram 就绪后同步命令 & 发送上线通知。"""
+    bind_tg_bot(tg_app.bot)
     try:
         await _sync_bot_commands(tg_app)
     except Exception as e:
         print(f"⚠️ Telegram 命令菜单同步失败: {e}")
     await app.run_daily_boot_checks()
-    app.initialize_background_tasks()
-    if await ensure_ib_connected():
-        print("✅ TWS 已连接，主客户端(Master Client)全局跨端监听已启动。")
+    if app.ib.isConnected():
         await _notify_system_online("启动")
-        await reconcile_physical_positions(tg_app)
     else:
-        print("⚠️ TWS 未连接，/init 报价与成交同步将不可用，Telegram 仍可运行。")
         await _notify_bot_only_online()
+
+
+# ── 代理清理：ALL_PROXY (socks5) 与 httpx 不兼容（缺少 httpx-socks），必须清除 ──
+for _env_key in ("ALL_PROXY", "all_proxy"):
+    os.environ.pop(_env_key, None)
+
+PROXY_URL = os.getenv("HTTPS_PROXY", os.getenv("HTTP_PROXY", "http://127.0.0.1:7897"))
 
 
 def main() -> None:
@@ -2002,6 +2566,8 @@ def main() -> None:
     tg_app = (
         Application.builder()
         .token(TG_BOT_TOKEN)
+        .connect_timeout(15)
+        .read_timeout(30)
         .build()
     )
 
@@ -2033,13 +2599,59 @@ def main() -> None:
         print("💻 [本地关机模式] EOD 狙击手休眠，夜间防线由 TWS 物理止损单全面接管。")
 
     async def runner() -> None:
-        async with tg_app:
-            await _post_init(tg_app)
-            await tg_app.start()
-            mode = "EOD 狙击手" if ENABLE_EOD_SNIPER else "物理止损兜底"
-            print(f"✅ Telegram Bot 军师巡检器已启动 (状态自检 + {mode})。")
-            await tg_app.updater.start_polling(drop_pending_updates=True)
-            await asyncio.Event().wait()
+        # ── 阶段 0：TWS + 数据库 + 守护进程（无需 Telegram）──
+        await _pre_init_core()
+
+        post_init_done = False
+        tg_ready = False
+
+        for tg_retry in range(50):
+            try:
+                async with tg_app:
+                    # ── 阶段 1：Telegram 上线通知 & 命令同步（仅一次）──
+                    if not post_init_done:
+                        await _post_init_telegram(tg_app)
+                        post_init_done = True
+                    await tg_app.start()
+                    mode = "EOD 狙击手" if ENABLE_EOD_SNIPER else "物理止损兜底"
+                    print(f"✅ Telegram Bot 军师巡检器已启动 (状态自检 + {mode})。")
+
+                    # ── 轮询（失败时在同一 context 内重试）──
+                    for poll_retry in range(10):
+                        try:
+                            await tg_app.updater.start_polling(
+                                drop_pending_updates=True, timeout=10, poll_interval=1.0
+                            )
+                            tg_ready = True
+                            await asyncio.Event().wait()
+                        except Exception as pe:
+                            if any(kw in str(pe).lower() for kw in (
+                                "httpx", "network", "connect", "remoteprotocol",
+                                "timed out", "timeout",
+                            )):
+                                print(f"⚠️ 轮询断开，{5}s 后重试 ({poll_retry + 1}/10): {pe}")
+                                try:
+                                    await tg_app.updater.stop()
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(5)
+                            else:
+                                raise
+                    if tg_ready:
+                        break  # 轮询正常结束（不会到这里）
+            except Exception as e:
+                if any(kw in str(e).lower() for kw in (
+                    "httpx", "network", "connect", "remoteprotocol",
+                    "timed out", "timeout", "still running",
+                )):
+                    delay = min(15 * (tg_retry + 1), 60)
+                    print(f"⚠️ Telegram 初始化失败，{delay}s 后重试 ({tg_retry + 1}/50): {e}")
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"❌ 未知错误: {e}")
+                    raise
+        if not tg_ready:
+            print("❌ Telegram 轮询多次失败，请检查代理后重启。")
 
     try:
         asyncio.run(runner())
