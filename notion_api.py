@@ -36,25 +36,30 @@ async def check_notion_online() -> tuple[bool, str]:
 
 
 def _build_notion_properties(payload: dict) -> dict:
-    """将内部 payload 转为 Notion API properties。"""
-    event = payload.get("event_type", "CLOSE")
-    symbol = payload["symbol"]
-    trade_id = payload["trade_id"]
+    """将内部 payload 转为 Notion API properties。
+
+    支持三种生命周期：
+    - OPEN:   建仓 — 写入标题/代码/数量/进场价/止损/SPY/Entry Date
+    - UPDATE: 改止损 — 更新 Current Stop / Risk Amount
+    - CLOSE:  平仓结算 — 写入退出价/盈亏/R-Multiple/Return%/Exit Date
+    """
+    event = payload.get("event_type", "OPEN")
+    symbol = payload.get("symbol", "UNKNOWN")
+    trade_id = payload.get("trade_id", 0)
     side = payload.get("side", "")
-    qty = payload.get("quantity", 0)
-    entry = payload.get("entry_price", 0)
-    exit_p = payload.get("exit_price", 0)
-    pnl = payload.get("realized_pnl", 0)
-    initial_stop = payload.get("initial_stop", 0)
-    current_stop = payload.get("current_stop", 0)
+    qty = float(payload.get("quantity", 0))
+    entry = float(payload.get("entry_price", 0))
+    exit_p = float(payload.get("exit_price", 0))
+    pnl = float(payload.get("realized_pnl", 0))
+    initial_stop = float(payload.get("initial_stop", 0))
+    current_stop = float(payload.get("current_stop", 0))
     tag = payload.get("setup_tag", "")
     confession = payload.get("confession", "")
     spy_ctx = payload.get("spy_context", "")
     create_time = payload.get("create_time", "")
     close_type = payload.get("close_type", "Full")
-    status = "CLOSED" if event == "CLOSE" else "OPEN"
 
-    # 风险计算
+    # ── 风险计算 ──
     notional = entry * qty
     risk_amount = 0.0
     if initial_stop > 0:
@@ -64,18 +69,56 @@ def _build_notion_properties(payload: dict) -> dict:
     r_multiple = round(pnl / risk_amount, 2) if risk_amount > 0 else None
     return_pct = round(pnl / notional * 100, 2) if notional > 0 else None
 
-    properties = {
-        "Tranche ID": {"title": [{"text": {"content": f"{symbol}-{trade_id}"}}]},
-        "Symbol": {"select": {"name": symbol}},
-        "Status": {"select": {"name": status}},
-        "Quantity": {"number": qty},
-        "Entry Price": {"number": round(entry, 2)},
-    }
+    properties: dict = {}
 
-    if side:
-        properties["Side"] = {"select": {"name": side.upper()}}
+    # ── OPEN: 建仓全量字段 ──
+    if event in ("OPEN", "UPDATE"):
+        if event == "OPEN":
+            properties["Tranche ID"] = {
+                "title": [{"text": {"content": f"{symbol}-{trade_id}"}}]
+            }
+            properties["Status"] = {"select": {"name": "OPEN"}}
+        else:
+            properties["Status"] = {"select": {"name": "OPEN"}}
 
+        properties["Symbol"] = {"select": {"name": symbol}}
+        if qty > 0:
+            properties["Quantity"] = {"number": qty}
+        if entry > 0:
+            properties["Entry Price"] = {"number": round(entry, 2)}
+        if side:
+            properties["Side"] = {"select": {"name": str(side).upper()}}
+
+        # 止损字段（始终写入，即使为 0）
+        properties["Initial Stop"] = {"number": round(initial_stop, 2)}
+        properties["Current Stop"] = {"number": round(current_stop, 2)}
+        if risk_amount > 0:
+            properties["Risk Amount"] = {"number": round(risk_amount, 2)}
+
+        # 日期 & 策略 & 环境
+        if create_time:
+            properties["Entry Date"] = {"date": {"start": str(create_time)[:10]}}
+        if tag:
+            tags = [{"name": t.strip()} for t in str(tag).split(",") if t.strip()]
+            if tags:
+                properties["Setup Tag"] = {"multi_select": tags}
+        if spy_ctx:
+            properties["SPY Context"] = {"rich_text": [{"text": {"content": str(spy_ctx)}}]}
+
+    # ── CLOSE: 平仓结算 ──
     if event == "CLOSE":
+        properties["Tranche ID"] = {
+            "title": [{"text": {"content": f"{symbol}-{trade_id}"}}]
+        }
+        properties["Symbol"] = {"select": {"name": symbol}}
+        properties["Status"] = {"select": {"name": "CLOSED"}}
+        if side:
+            properties["Side"] = {"select": {"name": str(side).upper()}}
+        if qty > 0:
+            properties["Quantity"] = {"number": qty}
+        if entry > 0:
+            properties["Entry Price"] = {"number": round(entry, 2)}
+
         properties["Close Type"] = {"select": {"name": close_type}}
         if exit_p > 0:
             properties["Exit Price"] = {"number": round(exit_p, 2)}
@@ -85,27 +128,18 @@ def _build_notion_properties(payload: dict) -> dict:
         if return_pct is not None:
             properties["Return %"] = {"number": return_pct}
         properties["Exit Date"] = {"date": {"start": datetime.date.today().isoformat()}}
-    else:
-        properties["Close Type"] = {"select": {"name": "Open"}}
 
-    if initial_stop > 0:
-        properties["Initial Stop"] = {"number": round(initial_stop, 2)}
-    if current_stop > 0:
-        properties["Current Stop"] = {"number": round(current_stop, 2)}
-    if risk_amount > 0:
-        properties["Risk Amount"] = {"number": round(risk_amount, 2)}
+        if tag:
+            tags = [{"name": t.strip()} for t in str(tag).split(",") if t.strip()]
+            if tags:
+                properties["Setup Tag"] = {"multi_select": tags}
+        if spy_ctx:
+            properties["SPY Context"] = {"rich_text": [{"text": {"content": str(spy_ctx)}}]}
 
-    if create_time:
-        properties["Entry Date"] = {"date": {"start": create_time[:10]}}
-    if tag:
-        tags = [{"name": t.strip()} for t in tag.split(",") if t.strip()]
-        if tags:
-            properties["Setup Tag"] = {"multi_select": tags}
+    # ── 公共字段 ──
     if confession:
-        properties["Confession"] = {"rich_text": [{"text": {"content": confession}}]}
+        properties["Confession"] = {"rich_text": [{"text": {"content": str(confession)}}]}
         properties["Violation"] = {"checkbox": True}
-    if spy_ctx:
-        properties["SPY Context"] = {"rich_text": [{"text": {"content": spy_ctx}}]}
 
     return properties
 

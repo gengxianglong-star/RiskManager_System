@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import re
 import time
 from datetime import datetime
 
 import aiohttp
+
+from logger import logger
+from ai_logger import ai_trace
 
 SHEET_ID = "1O6OhS7ciA8zwfycBfGPbP2fWJnR0pn2UUvFZVDP9jpE"
 MARKET_MONITOR_GID = "1082103394"
@@ -112,6 +116,7 @@ def _pick_latest_row(rows: list[list[str]]) -> list[str] | None:
     return best_row
 
 
+@ai_trace
 async def fetch_market_regime() -> tuple[str, str, float]:
     """
     拉取 Stockbee Market Monitor CSV，判定宏观环境。
@@ -122,37 +127,56 @@ async def fetch_market_regime() -> tuple[str, str, float]:
     if _cache and (now - _cache[0]) < _CACHE_TTL:
         return _cache[1]
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(trust_env=True) as session:
-            async with session.get(CSV_URL, timeout=timeout) as response:
-                response.raise_for_status()
-                text = await response.text()
+    # 加入 3 次重试机制防网络抖动
+    for attempt in range(3):
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                async with session.get(CSV_URL, timeout=timeout) as response:
+                    response.raise_for_status()
+                    text = await response.text()
 
-        rows = list(csv.reader(text.splitlines()))
-        latest_row = _pick_latest_row(rows)
-        if not latest_row:
-            result = (
-                REGIME_OFFLINE_LABEL,
-                "Google Sheet 无法解析宽度数据，仓位按正常满额(1.0x)执行",
-                1.0,
-            )
-        else:
-            result = _derive_regime(
-                _num(latest_row, 1),
-                _num(latest_row, 2),
-                _num(latest_row, 3),
-                _num(latest_row, 4),
-                _num(latest_row, 5),
-                _num(latest_row, 6),
-                _num(latest_row, 14),
-            )
-    except Exception as e:
-        result = (
-            REGIME_OFFLINE_LABEL,
-            f"Google Sheet 连接失败: {e}，仓位按正常满额(1.0x)执行",
-            1.0,
-        )
+            rows = list(csv.reader(text.splitlines()))
+            latest_row = _pick_latest_row(rows)
 
+            if not latest_row:
+                result = (
+                    REGIME_OFFLINE_LABEL,
+                    "无法解析宽度数据，按正常满额(1.0x)执行",
+                    1.0,
+                )
+            else:
+                # 应对可能出现的索引越界报错
+                try:
+                    result = _derive_regime(
+                        _num(latest_row, 1),
+                        _num(latest_row, 2),
+                        _num(latest_row, 3),
+                        _num(latest_row, 4),
+                        _num(latest_row, 5),
+                        _num(latest_row, 6),
+                        _num(latest_row, 14),
+                    )
+                except IndexError:
+                    logger.error("宽度 CSV 列数不足，判定降级。")
+                    result = (
+                        REGIME_OFFLINE_LABEL,
+                        "CSV 格式异常，按正常满额(1.0x)执行",
+                        1.0,
+                    )
+
+            _cache = (now, result)
+            return result
+
+        except Exception as e:
+            logger.warning(f"拉取 Market Regime 失败 (尝试 {attempt + 1}/3): {e}")
+            await asyncio.sleep(2)
+
+    logger.error("Market Regime 彻底连线失败。")
+    result = (
+        REGIME_OFFLINE_LABEL,
+        "Google Sheet 连接失败，仓位按正常满额(1.0x)执行",
+        1.0,
+    )
     _cache = (now, result)
     return result

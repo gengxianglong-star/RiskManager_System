@@ -14,7 +14,7 @@ TWS_PORT = int(os.getenv("TWS_PORT", "7497"))
 DEFAULT_PAPER_PORT = int(os.getenv("PAPER_PORT", "7497"))
 DEFAULT_LIVE_PORT = int(os.getenv("LIVE_PORT", "7496"))
 DESKTOP_SETTINGS_PATH = Path.home() / ".ibkr-order-tool" / "settings.json"
-CLIENT_ID = 0  # Master Client，必须为 0 才能跨端监听桌面端/手机订单
+CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))  # TWS API Client ID，避免与桌面端冲突
 FLEX_TOKEN = os.getenv("FLEX_TOKEN", "YOUR_FLEX_TOKEN")
 FLEX_QUERY_ID = os.getenv("FLEX_QUERY_ID", "YOUR_FLEX_QUERY_ID")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "YOUR_NOTION_TOKEN")
@@ -48,6 +48,12 @@ ENABLE_EOD_SNIPER = os.getenv("ENABLE_EOD_SNIPER", "false").lower() in (
     "true",
     "yes",
 )
+
+# ====== 提取硬编码参数与日志配置 ======
+THRESHOLD_3R = float(os.getenv("THRESHOLD_3R", "3.0"))          # 3R爆发提醒阈值
+EMA_PERIOD = int(os.getenv("EMA_PERIOD", "10"))                 # 均线狙击手周期
+FORCE_CONFESSION_HOUR = int(os.getenv("FORCE_CONFESSION_HOUR", "23")) # 强制坦白触发时间(小时)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")                      # 系统日志级别
 
 
 def resolve_tws_ports() -> tuple[int, int, str]:

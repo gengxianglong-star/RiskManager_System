@@ -9,11 +9,19 @@ from config import DB_PATH, DB_TIMEOUT, TRADING_TZ
 
 @asynccontextmanager
 async def connect_db():
-    """带连接级 PRAGMA 的 SQLite 连接生成器。"""
+    """带连接级 PRAGMA 的 SQLite 连接生成器。
+
+    关键加固：
+    - WAL 模式：读写并发互不阻塞
+    - busy_timeout：遇到写锁时排队等待，避免直接抛 database is locked
+    - synchronous=NORMAL：兼顾安全与性能（WAL 下崩溃不会损坏 DB）
+    """
     conn = await aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT)
     try:
+        await conn.execute("PRAGMA journal_mode=WAL;")
         await conn.execute("PRAGMA synchronous=NORMAL;")
-        await conn.execute("PRAGMA busy_timeout=10000;")
+        await conn.execute(f"PRAGMA busy_timeout={int(DB_TIMEOUT * 1000)};")
+        await conn.execute("PRAGMA foreign_keys=ON;")
         yield conn
     finally:
         await conn.close()
@@ -50,6 +58,12 @@ async def ensure_schema() -> None:
             )
             """
         )
+
+        # ====== 关键复合索引：防止表膨胀后 I/O 阻塞 ======
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_status ON shadow_ledger(status);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_symbol_status ON shadow_ledger(symbol, status);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_create_time ON shadow_ledger(create_time);")
+
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS account_state (

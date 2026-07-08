@@ -1,4 +1,6 @@
 risk_manager.db
+risk_manager.log
+risk_manager_trace.log
 .env
 __pycache__/
 *.pyc
