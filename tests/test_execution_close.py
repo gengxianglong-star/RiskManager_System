@@ -152,9 +152,10 @@ async def _seed_open_position(conn, symbol=SYMBOL, qty=INITIAL_QTY, entry=INITIA
 async def test_fifo_close_with_random_fills(fill_qty, fill_price):
     """对 LONG 100 股持仓执行随机数量的 SELL 成交，验证影子账本状态。
 
-    预期行为（基于当前实现）：
-    - fill_qty <= 100 → 部分或全部平仓，剩余仓位被保留
-    - fill_qty >  100 → 全额平仓，超出部分静默丢弃（不创建空头仓位）
+    预期行为：
+    - fill_qty <  100 → 部分平仓，剩余仓位被保留
+    - fill_qty ≈  100 → 全额平仓
+    - fill_qty >  100 → 全额平仓 + 创建反向仓位（卖超修正）
     """
     fill_qty = round(fill_qty, 4)
     fill_price = round(fill_price, 2)
@@ -196,12 +197,20 @@ async def test_fifo_close_with_random_fills(fill_qty, fill_price):
                 assert float(closed_rows[0]["exit_price"]) == fill_price
 
             else:
-                assert len(open_rows) == 0, (
-                    f"卖穿后应无 OPEN 记录（超出 {fill_qty - INITIAL_QTY:.1f} 股被丢弃），"
+                # ── 卖穿 (fill_qty > 100): 原仓位全平 + 新建反向仓位 ──
+                assert len(closed_rows) >= 1, f"原仓位应被关闭，实际 CLOSED={len(closed_rows)}"
+                assert float(closed_rows[0]["exit_price"]) == fill_price
+                # 新反向仓位
+                reverse_rows = [r for r in open_rows if r["side"] == "SHORT"]
+                assert len(reverse_rows) == 1, (
+                    f"应创建 1 笔 SHORT 反向仓位（超出 {fill_qty - INITIAL_QTY:.1f} 股），"
                     f"实际 OPEN={len(open_rows)}"
                 )
-                assert len(closed_rows) == 1, "应只有 1 笔被关闭的原仓位"
-                assert float(closed_rows[0]["exit_price"]) == fill_price
+                expected_reverse_qty = fill_qty - INITIAL_QTY
+                assert abs(float(reverse_rows[0]["quantity"]) - expected_reverse_qty) < 0.01, (
+                    f"反向仓位数量应为 {expected_reverse_qty}，"
+                    f"实际 {reverse_rows[0]['quantity']}"
+                )
     finally:
         _restore_outbound()
 

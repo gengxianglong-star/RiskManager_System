@@ -227,6 +227,12 @@ async def reconcile_physical_positions(ib, notify_func=None):
                 if not open_rows:
                     continue
 
+                if len(open_rows) > 1:
+                    logger.warning(
+                        f"⚠️ {sym} 存在 {len(open_rows)} 笔不同批次的持仓，"
+                        f"TWS 单一止损单兜底同步将覆盖所有批次的止损防线！"
+                    )
+
                 for row in open_rows:
                     entry = float(row["entry_price"])
                     old_init = float(row["initial_stop"])

@@ -190,86 +190,105 @@ async def run_flex_settlement(tg_notify_func=None):
                 )
                 continue
 
-            # 按 FIFO 找到最早的 OPEN 仓位
+            # 按 FIFO 拉取所有 OPEN 仓位（不再 LIMIT 1）
             cur = await db.execute(
                 "SELECT id, setup_tag, entry_price, initial_stop, quantity, side, "
                 "realized_pnl FROM shadow_ledger "
-                "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
+                "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
                 (symbol,),
             )
-            row = await cur.fetchone()
+            open_rows = await cur.fetchall()
 
-            if row:
+            if not open_rows:
+                await db.execute(
+                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
+                    (exec_id,),
+                )
+                continue
+
+            # 提取 Flex 报表中的真实成交数量（用于按比例分摊 PnL）
+            flex_qty = abs(float(
+                _flex_trade_attr(trade, "quantity", "Quantity", "shares", default=0) or 0
+            ))
+            if flex_qty < 1e-6:
+                flex_qty = sum(float(r["quantity"]) for r in open_rows)
+
+            remaining_qty = flex_qty
+            trade_pnl = realized_pnl
+
+            for row in open_rows:
+                if remaining_qty <= 1e-6:
+                    break
+
                 trade_id = row["id"]
                 setup_tag = row["setup_tag"] or ""
                 entry_p = float(row["entry_price"])
                 init_stop = float(row["initial_stop"])
-                curr_qty = float(row["quantity"])
+                db_qty = float(row["quantity"])
                 pos_side = row["side"]
                 old_pnl = float(row["realized_pnl"] or 0.0)
 
-                # 🚀 PnL 叠加：防止部分成交覆盖
-                new_total_pnl = old_pnl + realized_pnl
+                close_qty = min(db_qty, remaining_qty)
+                portion_pnl = trade_pnl * (close_qty / flex_qty) if flex_qty > 0 else trade_pnl
+                new_total_pnl = old_pnl + portion_pnl
+                new_qty = db_qty - close_qty
+                is_fully_closed = new_qty <= 1e-4
+                new_status = "CLOSED" if is_fully_closed else "OPEN"
 
-                initial_risk = abs(entry_p - init_stop) * curr_qty if init_stop > 0 else 0.0
-
-                # Flex 报表已确认本批次交割完成 → 无条件将 status 置为 CLOSED
-                # 防止 reconciliation 对账引擎将已平仓条目误判为"幽灵单"并覆写 PnL 为 0
                 await db.execute(
-                    "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? "
-                    "WHERE id=?",
-                    (exec_price, new_total_pnl, trade_id),
+                    "UPDATE shadow_ledger SET status=?, exit_price=?, quantity=?, "
+                    "realized_pnl=? WHERE id=?",
+                    (new_status, exec_price, new_qty, new_total_pnl, trade_id),
                 )
 
-                # 🚀 Minervini 击球率反馈
-                if realized_pnl > 0:
-                    await db.execute(
-                        "INSERT INTO system_state (key, value) VALUES "
-                        "('consecutive_losses', '0') "
-                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
-                    )
-                    logger.info(f"🎯 {symbol} 止盈，连亏计数器已重置。")
-                else:
-                    await db.execute(
-                        "INSERT INTO system_state (key, value) VALUES "
-                        "('consecutive_losses', '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = "
-                        "CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
-                    )
-                    logger.info(f"🩸 {symbol} 止损，连亏计数器 +1。")
+                initial_risk = abs(entry_p - init_stop) * db_qty if init_stop > 0 else 0.0
+                event_type = "CLOSE" if is_fully_closed else "UPDATE"
 
-                # 事件溯源
                 await enqueue_outbound(
-                    f"{trade_id}-CLOSE", "notion",
+                    f"{trade_id}-{event_type}_FLEX_{exec_id[-6:]}", "notion",
                     {
                         "trade_id": trade_id,
                         "symbol": symbol,
-                        "event_type": "CLOSE",
+                        "event_type": event_type,
                         "realized_pnl": new_total_pnl,
                         "setup_tag": setup_tag,
                         "initial_risk": initial_risk,
                         "entry_price": entry_p,
                         "exit_price": exec_price,
-                        "quantity": curr_qty,
+                        "quantity": new_qty,
                         "side": pos_side,
                     },
                 )
 
-                # 记录 exec_id，防止重复叠加
                 await db.execute(
                     "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
                     (exec_id,),
                 )
 
-                closed_count += 1
-                total_pnl += realized_pnl
-                closed_symbols.append(symbol)
-            else:
-                # 无 OPEN 仓位对应 → 仍记录已处理，避免死循环
+                if is_fully_closed:
+                    closed_count += 1
+                    closed_symbols.append(symbol)
+
+                remaining_qty -= close_qty
+
+            # ── 更新连亏计数器（基于整笔交易方向）──
+            if trade_pnl > 0:
                 await db.execute(
-                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
-                    (exec_id,),
+                    "INSERT INTO system_state (key, value) VALUES "
+                    "('consecutive_losses', '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = '0'"
                 )
+                logger.info(f"🎯 {symbol} 止盈，连亏计数器已重置。")
+            else:
+                await db.execute(
+                    "INSERT INTO system_state (key, value) VALUES "
+                    "('consecutive_losses', '1') "
+                    "ON CONFLICT(key) DO UPDATE SET value = "
+                    "CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                )
+                logger.info(f"🩸 {symbol} 止损，连亏计数器 +1。")
+
+            total_pnl += trade_pnl
 
         await db.execute(
             "INSERT OR REPLACE INTO system_state (key, value) VALUES "

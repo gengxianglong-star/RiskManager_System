@@ -204,6 +204,33 @@ class IBKRListener:
             lock = self.ctx.get_symbol_lock(symbol)
             async with lock:
                 async with connect_db() as conn:
+                    conn.row_factory = aiosqlite.Row
+                    cursor = await conn.execute(
+                        "SELECT id, side, quantity, entry_price, setup_tag "
+                        "FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
+                        (symbol,),
+                    )
+                    # 逐笔入队 Notion CLOSE 事件，杜绝斩立决后日记断档
+                    async for row in cursor:
+                        t_id = row["id"]
+                        t_qty = float(row["quantity"])
+                        t_entry = float(row["entry_price"])
+                        t_side = row["side"]
+                        actual_pnl = (
+                            (price - t_entry) * t_qty
+                            if t_side == "LONG"
+                            else (t_entry - price) * t_qty
+                        )
+                        await enqueue_outbound(
+                            f"{t_id}-CLOSE", "notion",
+                            {
+                                "trade_id": t_id, "symbol": symbol,
+                                "event_type": "CLOSE", "side": t_side,
+                                "quantity": t_qty, "entry_price": t_entry,
+                                "exit_price": price, "realized_pnl": actual_pnl,
+                                "setup_tag": (row["setup_tag"] or "KILL_SWITCH"),
+                            },
+                        )
                     await conn.execute(
                         "UPDATE shadow_ledger SET status='CLOSED', exit_price=? "
                         "WHERE symbol=? AND status='OPEN'",
@@ -217,7 +244,8 @@ class IBKRListener:
             async with connect_db() as conn:
                 conn.row_factory = aiosqlite.Row
                 cursor = await conn.execute(
-                    "SELECT id, side, quantity, entry_price, setup_tag FROM shadow_ledger "
+                    "SELECT id, side, quantity, entry_price, current_stop, "
+                    "realized_pnl, setup_tag FROM shadow_ledger "
                     "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
                     (symbol,),
                 )
@@ -397,18 +425,50 @@ class IBKRListener:
                             )
                             remaining_exit_qty -= t_qty
                         else:
-                            # 部分平仓
+                            # 部分平仓 — 计算被剪除部分的 PnL 并累加
                             new_qty = t_qty - remaining_exit_qty
+                            trimmed_pnl = (
+                                (price - t_entry) * remaining_exit_qty
+                                if tranche_side == "LONG"
+                                else (t_entry - price) * remaining_exit_qty
+                            )
+                            if trimmed_pnl < 0:
+                                had_loss = True
+                            elif trimmed_pnl > 0:
+                                had_profit = True
+
                             is_profitable_trim = (
                                 (tranche_side == "LONG" and price > t_entry)
                                 or (tranche_side == "SHORT" and price < t_entry)
                             )
+                            new_stop = t_entry if is_profitable_trim else float(row["current_stop"])
+
+                            await conn.execute(
+                                "UPDATE shadow_ledger "
+                                "SET quantity=?, current_stop=?, "
+                                "realized_pnl=COALESCE(realized_pnl, 0) + ? "
+                                "WHERE id=?",
+                                (new_qty, new_stop, trimmed_pnl, t_id),
+                            )
+
+                            # 推送 Notion UPDATE（剪除部分单独记录）
+                            total_realized = (
+                                float(row["realized_pnl"] or 0) + trimmed_pnl
+                            )
+                            await enqueue_outbound(
+                                f"{t_id}-UPDATE_PNL", "notion",
+                                {
+                                    "trade_id": t_id, "symbol": symbol,
+                                    "event_type": "UPDATE",
+                                    "quantity": new_qty,
+                                    "realized_pnl": total_realized,
+                                    "entry_price": t_entry,
+                                    "current_stop": new_stop,
+                                    "side": tranche_side,
+                                },
+                            )
+
                             if is_profitable_trim:
-                                had_profit = True
-                                await conn.execute(
-                                    "UPDATE shadow_ledger SET quantity=?, current_stop=? WHERE id=?",
-                                    (new_qty, t_entry, t_id),
-                                )
                                 trim_detail = (
                                     f"成交价: ${price:.2f} > 成本价: ${t_entry:.2f}"
                                     if tranche_side == "LONG"
@@ -422,18 +482,47 @@ class IBKRListener:
                                 await enqueue_outbound(
                                     f"{t_id}-PARTIAL_CLOSE", "telegram", {"message": msg},
                                 )
-                            else:
-                                if (tranche_side == "LONG" and price < t_entry) or (
-                                    tranche_side == "SHORT" and price > t_entry
-                                ):
-                                    had_loss = True
-                                await conn.execute(
-                                    "UPDATE shadow_ledger SET quantity=? WHERE id=?", (new_qty, t_id)
-                                )
+
                             remaining_exit_qty = 0
 
                     # ── 连亏追踪 ──
+                    # ── 卖穿检测：FIFO 循环结束后 remaining_exit_qty > 0 ──
+                    if remaining_exit_qty > 1e-6:
+                        # 卖超 → 剩余部分是反向仓位，方向与成交方向一致
+                        new_side = side
+                        tranche_num = len(open_tranches) + 1
+                        cursor = await conn.execute(
+                            "INSERT INTO shadow_ledger "
+                            "(symbol, tranche_id, side, quantity, entry_price, "
+                            "initial_stop, current_stop, status, setup_tag) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                            (symbol, f"T{tranche_num}", new_side,
+                             remaining_exit_qty, price,
+                             "Breakout" if new_side == "LONG" else "DS"),
+                        )
+                        new_trade_id = cursor.lastrowid
+                        await enqueue_outbound(
+                            f"{new_trade_id}-OPEN", "telegram",
+                            {"message": (
+                                f"🔄 **极速反向翻仓** `{symbol}`\n"
+                                f"原仓位已平尽，新开反向单 {new_side} "
+                                f"{remaining_exit_qty:.0f}股 @ ${price:.2f}"
+                            )},
+                        )
+                        self.ctx.spawn_background_task(
+                            self._delayed_bracket_stop_capture(symbol, new_trade_id)
+                        )
+
                     await _apply_consecutive_losses(conn, had_profit, had_loss)
+
+                    # ── 守夜人生命周期清理：标的不再有任何 OPEN 仓位 → 重置标志 ──
+                    cur_check = await conn.execute(
+                        "SELECT 1 FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
+                        (symbol,),
+                    )
+                    if not await cur_check.fetchone():
+                        self.ctx._nightwatchman_done.discard(symbol)
+
                 await conn.commit()
 
             # ── 平仓后触发守夜人 ──

@@ -149,11 +149,12 @@ async def outbound_worker(app):
                                 )
                                 tid = payload.get("trade_id", 0)
                                 if tid:
+                                    # 使用 json_extract 精确匹配，拒绝 LIKE 子串污染
                                     await db.execute(
                                         "UPDATE outbound_queue SET notion_page_id=? "
-                                        "WHERE payload_json LIKE ? AND channel='notion' "
-                                        "AND notion_page_id IS NULL",
-                                        (new_page_id, f'%"trade_id": {tid}%'),
+                                        "WHERE json_extract(payload_json, '$.trade_id') = ? "
+                                        "AND channel='notion' AND notion_page_id IS NULL",
+                                        (new_page_id, tid),
                                     )
 
                         # 投递成功：标记 sent
@@ -290,7 +291,11 @@ async def _send_notion(payload: dict, existing_page_id: str = "") -> str:
                     f"自动转为 Update 原位覆盖。"
                 )
         except Exception as e:
-            logger.warning(f"Notion 防重查询失败 (可能被限流或网络抖动)，将按原计划执行: {e}")
+            # 查询失败 → 必须向上抛出，让 outbound_worker 的重试机制接管
+            # 绝不能继续执行 pages.create 导致重复页面
+            raise RuntimeError(
+                f"Notion 防重查询失败，阻断页面创建以防止数据重复: {e}"
+            ) from e
 
     if existing_page_id:
         await notion.pages.update(page_id=existing_page_id, properties=props)
