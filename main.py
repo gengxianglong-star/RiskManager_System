@@ -228,7 +228,7 @@ class RiskManagerApp:
             run_flex_settlement,
             'cron',
             hour='9,16', minute='0,30',
-            args=[self.gateway.notify_user],
+            args=[self.gateway.notify_user, self.ib],
             id="flex_settlement_job",
             replace_existing=True,
         )
@@ -279,7 +279,7 @@ class RiskManagerApp:
         APScheduler 每天 09:00/16:30 自动调度 run_flex_settlement；
         此方法供 /sync 命令和 TWS 重连时手动触发。
         """
-        await run_flex_settlement(self.gateway.notify_user)
+        await run_flex_settlement(self.gateway.notify_user, self.ib)
 
     async def _heartbeat_2300_check(self):
         """23:00 强制坦白检查（由 APScheduler 每天触发，替代原 heartbeat_2300_daemon）。"""
@@ -642,7 +642,7 @@ async def _pre_init_core() -> None:
         # 🚀 恢复开机自动拉取 Flex：MD5 哈希防重 + 1001 静默保护已就绪
         # 即使频繁重启，也不会触发 IBKR 封禁。开机强拉可第一时间补齐离线期间的结算数据。
         await reconcile_physical_positions(app.ib, tg_gateway.notify_user)
-        app.spawn_background_task(run_flex_settlement(tg_gateway.notify_user))
+        app.spawn_background_task(run_flex_settlement(tg_gateway.notify_user, app.ib))
     else:
         logger.info("⚠️ TWS 未连接，/init 报价与成交同步将不可用。")
 

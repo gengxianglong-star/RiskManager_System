@@ -2,10 +2,13 @@
 Flex 权威结算引擎 (CQRS 读取端 / Single Source of Truth)。
 
 职责：定期拉取 IBKR Flex Query 官方报表，与本地影子账本进行权威对账，
-       关闭已平仓条目，归档盈亏，通过发件箱异步推送至 Notion。
+       关闭已平仓条目，归档盈亏，同步未平仓持仓到 Notion。
+
+两阶段处理：
+  阶段 1 — 已平仓交易（PnL ≠ 0）：匹配影子账本关仓，孤儿单也写入 Notion 供复盘
+  阶段 2 — 未平仓交易（PnL = 0）：对照 TWS 实时数据，更新/补录 Notion 持仓信息
 
 内置：MD5 哈希防重、连亏/连赢动态统计、1001/1025 限流保护。
-与主循环解耦：不依赖 TWS 实时连接，可独立调度运行。
 """
 
 import asyncio
@@ -31,16 +34,14 @@ def _flex_trade_attr(trade, *names, default=""):
 
 
 @ai_trace
-async def run_flex_settlement(tg_notify_func=None):
+async def run_flex_settlement(tg_notify_func=None, ib=None):
     """
-    Flex 官方结算 — CQRS 的权威读取端。
+    Flex 官方结算。
 
-    盘中 TWS 事件负责实时写入 OPEN 状态；
-    此函数负责滞后拉取官方成交报表，进行精确盈亏核销。
-
-    防重机制：
-    1. MD5 哈希签名：报表内容未变 → 静默跳过
-    2. realized_pnl ≈ 0 → 跳过（未平仓，交由 TWS 实时接口处理）
+    阶段 1 — 关仓核销：逐笔已实现盈亏的交易匹配影子账本，关仓 + 推送 Notion。
+              若影子账本无匹配（已被 TWS 实时监听先关），仍入队孤儿 CLOSE 记录。
+    阶段 2 — 持仓同步：PnL=0 的未平仓交易，拉取 TWS 实时仓位对比，
+              股数/成本不匹配则 Notion UPDATE，账本缺失则自动导入 + Notion OPEN。
     """
     if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
         logger.info("未配置 Flex Token / Query ID，跳过权威结算。")
@@ -71,15 +72,12 @@ async def run_flex_settlement(tg_notify_func=None):
             break
         except Exception as fe:
             err_msg = str(fe)
-
-            # 🚨 1001/1025 限流：重试毫无意义，直接跳过
             if any(kw in err_msg for kw in ("1001", "1025")):
                 logger.warning(
                     f"⚠️ Flex 报表遭遇 IBKR 限流 ({err_msg[:60]})，"
                     f"系统将跳过本次对账，等待下次定时任务自动重试。"
                 )
                 return
-
             retryable = any(kw in err_msg.lower() for kw in (
                 "could not be generated", "ssl", "eof",
                 "timeout", "connection",
@@ -124,14 +122,11 @@ async def run_flex_settlement(tg_notify_func=None):
         db.row_factory = lambda cursor, row: dict(
             zip([c[0] for c in cursor.description], row)
         )
-
-        # 🚀 exec 级防重表：防止同一笔成交被重复叠加 PnL
         await db.execute(
             "CREATE TABLE IF NOT EXISTS flex_processed_execs ("
             "exec_id TEXT PRIMARY KEY, "
             "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
         )
-        # 自动清理 30 天前的历史记录，防止无限膨胀
         await db.execute(
             "DELETE FROM flex_processed_execs "
             "WHERE processed_at < datetime('now', '-30 days')"
@@ -141,22 +136,23 @@ async def run_flex_settlement(tg_notify_func=None):
             "SELECT value FROM system_state WHERE key='last_flex_hash'"
         )
         hash_row = await cur.fetchone()
-
         if hash_row and hash_row["value"] == current_hash:
             logger.info("✅ 报表哈希比对一致，无新清算记录，安全跳过。")
             return
 
-        # ── 逐笔核销 ──
+        # ═══════════════════════════════════════════════════
+        # 阶段 1：逐笔核销已平仓交易（realized_pnl ≠ 0）
+        # ═══════════════════════════════════════════════════
         closed_count = 0
         total_pnl = 0.0
         closed_symbols: list[str] = []
+        orphan_closes = 0
 
         for trade in trades:
             symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
             if not symbol:
                 continue
 
-            # 生成全局唯一 exec_id（防重基石）
             exec_id = _flex_trade_attr(trade, "ibExecID", "ibOrderID", "tradeID")
             if not exec_id:
                 exec_id = hashlib.md5(
@@ -164,7 +160,6 @@ async def run_flex_settlement(tg_notify_func=None):
                     f"{getattr(trade, 'fifoPnlRealized', 0)}".encode()
                 ).hexdigest()
 
-            # exec 级查重：已处理过的成交直接跳过
             cur = await db.execute(
                 "SELECT 1 FROM flex_processed_execs WHERE exec_id=?", (exec_id,)
             )
@@ -182,7 +177,7 @@ async def run_flex_settlement(tg_notify_func=None):
                 ) or 0
             )
 
-            # 未实现盈亏 → 记录已处理并跳过
+            # ── 未实现盈亏 → 跳过，留给阶段 2 处理 ──
             if abs(realized_pnl) < 1e-4:
                 await db.execute(
                     "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
@@ -190,7 +185,7 @@ async def run_flex_settlement(tg_notify_func=None):
                 )
                 continue
 
-            # 按 FIFO 拉取所有 OPEN 仓位（不再 LIMIT 1）
+            # 查询影子账本 OPEN 仓位
             cur = await db.execute(
                 "SELECT id, setup_tag, entry_price, initial_stop, quantity, side, "
                 "realized_pnl FROM shadow_ledger "
@@ -200,13 +195,42 @@ async def run_flex_settlement(tg_notify_func=None):
             open_rows = await cur.fetchall()
 
             if not open_rows:
+                # ── 孤儿关仓：Flex 显示已平仓，但影子账本无 OPEN 仓位 ──
+                #    仍然写入 Notion，确保交易日记完整
+                flex_qty = abs(float(
+                    _flex_trade_attr(trade, "quantity", "Quantity", "shares", default=0) or 0
+                ))
+                trade_side = _flex_trade_attr(trade, "buySell", "side", "buy/Sell", default="")
+                if not trade_side:
+                    trade_side = "LONG" if realized_pnl > 0 else "SHORT"
+
+                await enqueue_outbound(
+                    f"FLEX_ORPHAN_{exec_id[-8:]}", "notion",
+                    {
+                        "trade_id": 0,
+                        "symbol": symbol,
+                        "event_type": "CLOSE",
+                        "realized_pnl": realized_pnl,
+                        "setup_tag": "FLEX_ORPHAN",
+                        "entry_price": exec_price,
+                        "exit_price": exec_price,
+                        "quantity": flex_qty if flex_qty > 0 else 0,
+                        "side": trade_side,
+                    },
+                )
                 await db.execute(
                     "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
                     (exec_id,),
                 )
+                orphan_closes += 1
+                total_pnl += realized_pnl
+                logger.info(
+                    f"👻 [孤儿关仓] {symbol} PnL=${realized_pnl:.2f} "
+                    f"→ 影子账本无匹配，已写入 Notion 供复盘"
+                )
                 continue
 
-            # 提取 Flex 报表中的真实成交数量（用于按比例分摊 PnL）
+            # ── 正常关仓：匹配到 OPEN 仓位，FIFO 核销 ──
             flex_qty = abs(float(
                 _flex_trade_attr(trade, "quantity", "Quantity", "shares", default=0) or 0
             ))
@@ -268,10 +292,9 @@ async def run_flex_settlement(tg_notify_func=None):
                 if is_fully_closed:
                     closed_count += 1
                     closed_symbols.append(symbol)
-
                 remaining_qty -= close_qty
 
-            # ── 更新连亏计数器（基于整笔交易方向）──
+            # ── 更新连亏计数器 ──
             if trade_pnl > 0:
                 await db.execute(
                     "INSERT INTO system_state (key, value) VALUES "
@@ -287,8 +310,122 @@ async def run_flex_settlement(tg_notify_func=None):
                     "CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
                 )
                 logger.info(f"🩸 {symbol} 止损，连亏计数器 +1。")
-
             total_pnl += trade_pnl
+
+        # ═══════════════════════════════════════════════════
+        # 阶段 2：持仓同步（PnL=0 的未平仓交易 ↔ TWS 实时数据）
+        # ═══════════════════════════════════════════════════
+        sync_count = 0
+        if ib and ib.isConnected():
+            try:
+                tws_positions = {
+                    p.contract.symbol: p
+                    for p in await ib.reqPositionsAsync()
+                    if p.contract.secType == "STK" and p.position != 0
+                }
+            except Exception as e:
+                logger.warning(f"阶段2 TWS 持仓拉取失败: {e}")
+                tws_positions = {}
+        else:
+            tws_positions = {}
+
+        # 收集阶段 1 跳过处理的未平仓标的
+        synced_symbols: set[str] = set()
+        for trade in trades:
+            symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
+            if not symbol or symbol in synced_symbols:
+                continue
+
+            realized_pnl = float(
+                _flex_trade_attr(
+                    trade,
+                    "fifoPnlRealized", "realizedPL", "realizedPnl", "RealizedP/L",
+                    default=0,
+                ) or 0
+            )
+            # 只处理未实现盈亏的（仍持有的）
+            if abs(realized_pnl) >= 1e-4:
+                continue
+
+            synced_symbols.add(symbol)
+            tws_pos = tws_positions.get(symbol)
+
+            # 查影子账本
+            cur = await db.execute(
+                "SELECT id, side, quantity, entry_price, current_stop, setup_tag "
+                "FROM shadow_ledger WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
+                (symbol,),
+            )
+            ledger_rows = await cur.fetchall()
+
+            if tws_pos is None:
+                # TWS 无仓位 → 跳过（无法对比）
+                continue
+
+            tws_qty = abs(float(tws_pos.position))
+            tws_side = "LONG" if float(tws_pos.position) > 0 else "SHORT"
+            tws_avg = float(tws_pos.avgCost) if tws_pos.avgCost and float(tws_pos.avgCost) > 0 else 0
+
+            if not ledger_rows:
+                # ── 账本无记录，TWS 有 → 自动导入 + Notion OPEN ──
+                if tws_avg <= 0:
+                    continue
+                tranche_id = "T1"
+                cur = await db.execute(
+                    "INSERT INTO shadow_ledger "
+                    "(symbol, tranche_id, side, quantity, entry_price, "
+                    "initial_stop, current_stop, status, setup_tag) "
+                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'FLEX_SYNC')",
+                    (symbol, tranche_id, tws_side, tws_qty, tws_avg),
+                )
+                new_id = cur.lastrowid
+                await enqueue_outbound(
+                    f"{new_id}-OPEN", "notion",
+                    {
+                        "trade_id": new_id, "symbol": symbol,
+                        "event_type": "OPEN", "side": tws_side,
+                        "quantity": tws_qty, "entry_price": tws_avg,
+                        "initial_stop": 0.0, "current_stop": 0.0,
+                        "setup_tag": "FLEX_SYNC",
+                    },
+                )
+                sync_count += 1
+                logger.info(f"📥 [Flex Sync] {symbol} 自动导入: {tws_side} {tws_qty}股 @ ${tws_avg:.2f}")
+                continue
+
+            # ── 账本有记录 → 对比 TWS，不一致则 Notion UPDATE ──
+            ledger_total_qty = sum(float(r["quantity"]) for r in ledger_rows)
+            ledger_side = ledger_rows[0]["side"]
+
+            qty_match = abs(ledger_total_qty - tws_qty) < 0.01
+            side_match = ledger_side == tws_side
+            price_match = (
+                abs(float(ledger_rows[0]["entry_price"]) - tws_avg) / max(tws_avg, 0.01) < 0.01
+                if tws_avg > 0 else True
+            )
+
+            if not (qty_match and side_match and price_match):
+                for row in ledger_rows:
+                    await enqueue_outbound(
+                        f"{row['id']}-UPDATE_FLEX_SYNC", "notion",
+                        {
+                            "trade_id": row["id"], "symbol": symbol,
+                            "event_type": "UPDATE",
+                            "quantity": tws_qty if not qty_match else float(row["quantity"]),
+                            "entry_price": tws_avg if not price_match else float(row["entry_price"]),
+                            "side": tws_side if not side_match else row["side"],
+                            "current_stop": float(row["current_stop"]),
+                        },
+                    )
+                sync_count += 1
+                mismatch_parts = []
+                if not qty_match:
+                    mismatch_parts.append(f"股数 {ledger_total_qty}→{tws_qty}")
+                if not side_match:
+                    mismatch_parts.append(f"方向 {ledger_side}→{tws_side}")
+                if not price_match:
+                    mismatch_parts.append(f"成本 ${float(ledger_rows[0]['entry_price']):.2f}→${tws_avg:.2f}")
+                logger.info(f"🔄 [Flex Sync] {symbol} 不一致 ({', '.join(mismatch_parts)})，已推送 Notion UPDATE")
 
         await db.execute(
             "INSERT OR REPLACE INTO system_state (key, value) VALUES "
@@ -298,20 +435,23 @@ async def run_flex_settlement(tg_notify_func=None):
         await db.commit()
 
     # ── 汇报 ──
+    parts: list[str] = []
     if closed_count > 0:
-        pnl_str = (
-            f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+        pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+        parts.append(
+            f"✅ 关仓 {closed_count} 笔：{', '.join(closed_symbols)}，合计 {pnl_str}"
         )
-        msg = (
-            f"✅ **Flex 权威清算完成**\n"
-            f"成功关闭 {closed_count} 笔仓位：{', '.join(closed_symbols)}\n"
-            f"合计盈亏: {pnl_str}\n"
-            f"连亏计数器已同步更新，数据已归档至 Notion。"
-        )
+    if orphan_closes > 0:
+        parts.append(f"👻 孤儿关仓 {orphan_closes} 笔（影子账本无匹配，已写入 Notion）")
+    if sync_count > 0:
+        parts.append(f"📊 持仓同步 {sync_count} 笔（与 TWS 对比后更新/导入）")
+
+    if parts:
+        msg = "✅ **Flex 权威结算完成**\n" + "\n".join(parts)
         logger.info(msg.replace("\n", " | "))
         if tg_notify_func:
             await tg_notify_func(msg)
     else:
         logger.info("🧾 Flex 报表拉取成功，当前没有需要清算的 OPEN 仓位。")
 
-    return closed_count, total_pnl
+    return closed_count + orphan_closes, total_pnl
