@@ -5,3 +5,4 @@ risk_manager_trace.log
 __pycache__/
 *.pyc
 .venv/
+bot_output.log
