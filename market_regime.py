@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import csv
 import re
+import ssl
 import time
 from datetime import datetime
 
 import aiohttp
+import certifi
 
 from logger import logger
 from ai_logger import ai_trace
@@ -131,7 +133,9 @@ async def fetch_market_regime() -> tuple[str, str, float]:
     for attempt in range(3):
         try:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(trust_env=True) as session:
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            async with aiohttp.ClientSession(trust_env=True, connector=connector) as session:
                 async with session.get(CSV_URL, timeout=timeout) as response:
                     response.raise_for_status()
                     text = await response.text()

@@ -4,11 +4,13 @@ Flex 权威结算引擎 (CQRS 读取端 / Single Source of Truth)。
 职责：定期拉取 IBKR Flex Query 官方报表，与本地影子账本进行权威对账，
        关闭已平仓条目，归档盈亏，通过发件箱异步推送至 Notion。
 
+内置：MD5 哈希防重、连亏/连赢动态统计、1001/1025 限流保护。
 与主循环解耦：不依赖 TWS 实时连接，可独立调度运行。
 """
 
 import asyncio
 import datetime
+import hashlib
 
 import pandas_market_calendars as mcal
 from ib_insync import FlexReport
@@ -35,6 +37,10 @@ async def run_flex_settlement(tg_notify_func=None):
 
     盘中 TWS 事件负责实时写入 OPEN 状态；
     此函数负责滞后拉取官方成交报表，进行精确盈亏核销。
+
+    防重机制：
+    1. MD5 哈希签名：报表内容未变 → 静默跳过
+    2. realized_pnl ≈ 0 → 跳过（未平仓，交由 TWS 实时接口处理）
     """
     if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
         logger.info("未配置 Flex Token / Query ID，跳过权威结算。")
@@ -65,8 +71,17 @@ async def run_flex_settlement(tg_notify_func=None):
             break
         except Exception as fe:
             err_msg = str(fe)
+
+            # 🚨 1001/1025 限流：重试毫无意义，直接跳过
+            if any(kw in err_msg for kw in ("1001", "1025")):
+                logger.warning(
+                    f"⚠️ Flex 报表遭遇 IBKR 限流 ({err_msg[:60]})，"
+                    f"系统将跳过本次对账，等待下次定时任务自动重试。"
+                )
+                return
+
             retryable = any(kw in err_msg.lower() for kw in (
-                "1001", "could not be generated", "ssl", "eof",
+                "could not be generated", "ssl", "eof",
                 "timeout", "connection",
             ))
             if retryable:
@@ -84,19 +99,76 @@ async def run_flex_settlement(tg_notify_func=None):
         logger.error("❌ Flex 报表 3 次重试均未就绪，本轮结算取消。")
         return
 
-    # ── 逐笔核销 ──
-    closed_count = 0
-    total_pnl = 0.0
-    closed_symbols: list[str] = []
+    trades = report.extract("Trade")
+    if not trades:
+        logger.info("🧾 Flex 报表中无任何交易记录。")
+        return
+
+    # ── MD5 哈希防重 ──
+    signature_factors = [
+        (
+            _flex_trade_attr(t, "symbol", "underlyingSymbol"),
+            float(_flex_trade_attr(t, "tradePrice", "TradePrice", default=0) or 0),
+            float(
+                _flex_trade_attr(
+                    t, "fifoPnlRealized", "realizedPL", "realizedPnl", "RealizedP/L",
+                    default=0,
+                ) or 0
+            ),
+        )
+        for t in trades
+    ]
+    current_hash = hashlib.md5(str(signature_factors).encode("utf-8")).hexdigest()
 
     async with connect_db() as db:
         db.row_factory = lambda cursor, row: dict(
             zip([c[0] for c in cursor.description], row)
         )
 
-        for trade in report.extract("Trade"):
+        # 🚀 exec 级防重表：防止同一笔成交被重复叠加 PnL
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS flex_processed_execs ("
+            "exec_id TEXT PRIMARY KEY, "
+            "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        # 自动清理 30 天前的历史记录，防止无限膨胀
+        await db.execute(
+            "DELETE FROM flex_processed_execs "
+            "WHERE processed_at < datetime('now', '-30 days')"
+        )
+
+        cur = await db.execute(
+            "SELECT value FROM system_state WHERE key='last_flex_hash'"
+        )
+        hash_row = await cur.fetchone()
+
+        if hash_row and hash_row["value"] == current_hash:
+            logger.info("✅ 报表哈希比对一致，无新清算记录，安全跳过。")
+            return
+
+        # ── 逐笔核销 ──
+        closed_count = 0
+        total_pnl = 0.0
+        closed_symbols: list[str] = []
+
+        for trade in trades:
             symbol = _flex_trade_attr(trade, "symbol", "underlyingSymbol")
             if not symbol:
+                continue
+
+            # 生成全局唯一 exec_id（防重基石）
+            exec_id = _flex_trade_attr(trade, "ibExecID", "ibOrderID", "tradeID")
+            if not exec_id:
+                exec_id = hashlib.md5(
+                    f"{symbol}-{getattr(trade, 'tradePrice', 0)}-"
+                    f"{getattr(trade, 'fifoPnlRealized', 0)}".encode()
+                ).hexdigest()
+
+            # exec 级查重：已处理过的成交直接跳过
+            cur = await db.execute(
+                "SELECT 1 FROM flex_processed_execs WHERE exec_id=?", (exec_id,)
+            )
+            if await cur.fetchone():
                 continue
 
             exec_price = float(
@@ -110,10 +182,18 @@ async def run_flex_settlement(tg_notify_func=None):
                 ) or 0
             )
 
-            # 按 FIFO 找到最早的 OPEN 仓位进行核销（含 initial_risk 计算因子）
+            # 未实现盈亏 → 记录已处理并跳过
+            if abs(realized_pnl) < 1e-4:
+                await db.execute(
+                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
+                    (exec_id,),
+                )
+                continue
+
+            # 按 FIFO 找到最早的 OPEN 仓位
             cur = await db.execute(
-                "SELECT id, setup_tag, entry_price, initial_stop, quantity, side "
-                "FROM shadow_ledger "
+                "SELECT id, setup_tag, entry_price, initial_stop, quantity, side, "
+                "realized_pnl FROM shadow_ledger "
                 "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
                 (symbol,),
             )
@@ -124,42 +204,77 @@ async def run_flex_settlement(tg_notify_func=None):
                 setup_tag = row["setup_tag"] or ""
                 entry_p = float(row["entry_price"])
                 init_stop = float(row["initial_stop"])
-                qty = float(row["quantity"])
+                curr_qty = float(row["quantity"])
                 pos_side = row["side"]
+                old_pnl = float(row["realized_pnl"] or 0.0)
 
-                # 计算 initial_risk：Notion R-Multiple 计算的基石
-                initial_risk = 0.0
-                if init_stop > 0:
-                    initial_risk = abs(entry_p - init_stop) * qty
+                # 🚀 PnL 叠加：防止部分成交覆盖
+                new_total_pnl = old_pnl + realized_pnl
 
-                # 权威覆盖：用 Flex 官方数据关闭本地账本
+                initial_risk = abs(entry_p - init_stop) * curr_qty if init_stop > 0 else 0.0
+
+                # 权威覆盖
                 await db.execute(
-                    "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? "
+                    "UPDATE shadow_ledger SET exit_price=?, realized_pnl=? "
                     "WHERE id=?",
-                    (exec_price, realized_pnl, trade_id),
+                    (exec_price, new_total_pnl, trade_id),
                 )
 
-                # 事件溯源：通过发件箱异步推送 Notion（含完整结算字段）
+                # 🚀 Minervini 击球率反馈
+                if realized_pnl > 0:
+                    await db.execute(
+                        "INSERT INTO system_state (key, value) VALUES "
+                        "('consecutive_losses', '0') "
+                        "ON CONFLICT(key) DO UPDATE SET value = '0'"
+                    )
+                    logger.info(f"🎯 {symbol} 止盈，连亏计数器已重置。")
+                else:
+                    await db.execute(
+                        "INSERT INTO system_state (key, value) VALUES "
+                        "('consecutive_losses', '1') "
+                        "ON CONFLICT(key) DO UPDATE SET value = "
+                        "CAST(CAST(value AS INTEGER) + 1 AS TEXT)"
+                    )
+                    logger.info(f"🩸 {symbol} 止损，连亏计数器 +1。")
+
+                # 事件溯源
                 await enqueue_outbound(
                     f"{trade_id}-CLOSE", "notion",
                     {
                         "trade_id": trade_id,
                         "symbol": symbol,
                         "event_type": "CLOSE",
-                        "realized_pnl": realized_pnl,
+                        "realized_pnl": new_total_pnl,
                         "setup_tag": setup_tag,
-                        "initial_risk": initial_risk,       # R-Multiple 计算因子
-                        "entry_price": entry_p,             # Return % 计算
-                        "exit_price": exec_price,           # Return % 计算
-                        "quantity": qty,
+                        "initial_risk": initial_risk,
+                        "entry_price": entry_p,
+                        "exit_price": exec_price,
+                        "quantity": curr_qty,
                         "side": pos_side,
                     },
+                )
+
+                # 记录 exec_id，防止重复叠加
+                await db.execute(
+                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
+                    (exec_id,),
                 )
 
                 closed_count += 1
                 total_pnl += realized_pnl
                 closed_symbols.append(symbol)
+            else:
+                # 无 OPEN 仓位对应 → 仍记录已处理，避免死循环
+                await db.execute(
+                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
+                    (exec_id,),
+                )
 
+        await db.execute(
+            "INSERT OR REPLACE INTO system_state (key, value) VALUES "
+            "('last_flex_hash', ?)",
+            (current_hash,),
+        )
         await db.commit()
 
     # ── 汇报 ──
@@ -171,7 +286,7 @@ async def run_flex_settlement(tg_notify_func=None):
             f"✅ **Flex 权威清算完成**\n"
             f"成功关闭 {closed_count} 笔仓位：{', '.join(closed_symbols)}\n"
             f"合计盈亏: {pnl_str}\n"
-            f"数据已通过发件箱异步归档至 Notion。"
+            f"连亏计数器已同步更新，数据已归档至 Notion。"
         )
         logger.info(msg.replace("\n", " | "))
         if tg_notify_func:

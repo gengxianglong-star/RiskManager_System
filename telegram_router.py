@@ -401,7 +401,7 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await conn.execute(
                 "INSERT INTO shadow_ledger "
                 "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
-                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'IMPORT')",
+                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'TWS_SYNC')",
                 (sym, tranche_id, side, qty, entry),
             )
             imported.append(f"{side} {sym} {qty:.0f}股 @ {entry:.2f}")

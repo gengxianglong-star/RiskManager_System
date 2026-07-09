@@ -68,11 +68,20 @@ class RiskEngine:
             return "🟢 绿灯", current_total_equity * RISK_PCT_PER_TRADE
 
         drawdown = (hwm - current_total_equity) / hwm
-        if drawdown < RISK_MAX_DRAWDOWN_GREEN:
-            return "🟢 绿灯", current_total_equity * RISK_PCT_PER_TRADE
-        if drawdown < RISK_MAX_DRAWDOWN_YELLOW:
-            return "🟡 黄灯", current_total_equity * (RISK_PCT_PER_TRADE / 2)
-        return "🔴 红灯", 0.0
+
+        # 🚀 Minervini 连亏惩罚：击球率下降 → 强制缩减暴露
+        cursor = await db_connection.execute(
+            "SELECT value FROM system_state WHERE key='consecutive_losses'"
+        )
+        loss_row = await cursor.fetchone()
+        consecutive_losses = int(loss_row[0]) if loss_row else 0
+
+        if drawdown >= RISK_MAX_DRAWDOWN_YELLOW or consecutive_losses >= 5:
+            return f"🔴 红灯 (连亏:{consecutive_losses})", 0.0
+        if drawdown >= RISK_MAX_DRAWDOWN_GREEN or consecutive_losses >= 3:
+            return f"🟡 黄灯 (连亏:{consecutive_losses})", current_total_equity * (RISK_PCT_PER_TRADE / 2)
+
+        return "🟢 绿灯", current_total_equity * RISK_PCT_PER_TRADE
 
     # ── 建仓审查 ──
 
@@ -92,14 +101,8 @@ class RiskEngine:
         if base_risk_budget <= 0:
             return f"🚨 风控灯 {risk_light}，当前禁止新开仓。"
 
-        regime_label, _, risk_mult = await fetch_market_regime()
-
-        if is_buy:
-            if risk_mult == 0.0 or "BEAR THRUST" in regime_label.upper():
-                return "🛑 **多头环境一票否决！** Bear Thrust 属于大盘下行坍塌期，严禁做多突破。"
-        else:
-            if "BULL THRUST" in regime_label.upper():
-                return "🛑 **空头环境一票否决！** Bull Thrust 属于大盘强动量轧空期，严禁逆势做空。"
+        # 🚨 已移除 SPY Market Regime 的一票否决和风险乘数干预。
+        # 风控 100% 信任主观图形判断，只要账户资金曲线允许（绿灯/黄灯），一律放行。
 
         cursor = await conn.execute(
             "SELECT entry_price, current_stop, quantity, side FROM shadow_ledger "
@@ -325,8 +328,10 @@ async def eod_10ema_sniper_job(context) -> None:
 
     async with connect_db() as db:
         db.row_factory = __import__("aiosqlite").Row
+        # 🚀 优化：同时拉取止损信息，只对 Runner（已锁利润）仓位执行 10EMA 审判
         cursor = await db.execute(
-            "SELECT symbol, side FROM shadow_ledger WHERE status='OPEN'"
+            "SELECT symbol, side, entry_price, initial_stop, current_stop "
+            "FROM shadow_ledger WHERE status='OPEN'"
         )
         open_positions = await cursor.fetchall()
 
@@ -337,6 +342,23 @@ async def eod_10ema_sniper_job(context) -> None:
     for pos in open_positions:
         sym = pos["symbol"]
         side = pos["side"]
+        init_stop = float(pos["initial_stop"] or 0)
+        curr_stop = float(pos["current_stop"] or 0)
+
+        # 🚀 Qullamaggie Runner 判定：止损必须推过保本点才算 Runner
+        # 防止 init_stop=0 时任何正止损都被错误判定为 Runner
+        is_runner = False
+        entry = float(pos["entry_price"])
+        if init_stop > 0:
+            if side == "LONG" and curr_stop >= entry:
+                is_runner = True
+            if side == "SHORT" and curr_stop <= entry:
+                is_runner = True
+        if not is_runner:
+            logger.info(
+                f"🛡️ {sym} 尚处建仓试错期 (止损未移动)，免除 10EMA 收盘审判，由初始止损保护。"
+            )
+            continue
 
         ema_10 = await ctx.risk_engine.get_10ema(sym)
         current_price, _ = await ctx.ib_listener.fetch_entry_price(sym)

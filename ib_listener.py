@@ -124,6 +124,20 @@ class IBKRListener:
         if not qualified:
             return None, ""
 
+        # 🚀 强制快照拉取，规避 NaN / 过期缓存
+        try:
+            ticker = await self.ib.reqMktDataAsync(
+                contract, "", True, False, timeout=3.0
+            )
+            if ticker:
+                if ticker.last and ticker.last > 0:
+                    return float(ticker.last), "last"
+                if ticker.close and ticker.close > 0:
+                    return float(ticker.close), "close"
+        except Exception:
+            pass
+
+        # 降级：快照失败时回退到 reqTickersAsync
         tickers = await self.ib.reqTickersAsync(contract)
         if tickers:
             ticker = tickers[0]
@@ -262,6 +276,12 @@ class IBKRListener:
                         else:
                             merged_tag = old_tag
 
+                        # 🚀 Minervini 铁律：侦测向下摊平 (Averaging Down)
+                        is_averaging_down = (
+                            (side == "LONG" and price < old_entry)
+                            or (side == "SHORT" and price > old_entry)
+                        )
+
                         if stop_for_val > 0:
                             await conn.execute(
                                 "UPDATE shadow_ledger "
@@ -276,16 +296,32 @@ class IBKRListener:
                                 (new_qty, new_entry, merged_tag, same_day_row["id"]),
                             )
                             stop_msg = "⚠️ 警告: 未侦测到新止损单，请手动在 TWS 补齐防线"
+
+                        violation_warning = (
+                            "\n⚠️ **严重纪律违规：侦测到向下摊平 (Averaging Down)！**"
+                            if is_averaging_down else ""
+                        )
                         await conn.commit()
                         msg = (
                             f"🎯 **前端火力捕获 (同日加仓)**\n"
                             f"已接管来自 UI 的加仓指令：`{symbol}`\n"
                             f"新增: {qty:.0f}股 @ ${price:.2f} (均价拉至 ${new_entry:.2f})\n"
                             f"策略: {merged_tag or '未打标'}\n{stop_msg}"
+                            f"{violation_warning}"
                         )
-                        await enqueue_outbound(
-                            f"{same_day_row['id']}-ADD", "telegram", {"message": msg},
-                        )
+                        await enqueue_outbound(f"{same_day_row['id']}-ADD", "telegram", {"message": msg})
+
+                        # 违规标记写入 Notion
+                        if is_averaging_down:
+                            await enqueue_outbound(
+                                f"{same_day_row['id']}-VIOLATION", "notion",
+                                {
+                                    "trade_id": same_day_row["id"],
+                                    "symbol": symbol,
+                                    "event_type": "UPDATE",
+                                    "confession": "系统侦测：逆势向下摊平(Averaging Down)",
+                                },
+                            )
                     else:
                         # 全新开仓
                         tranche_id = f"T{len(open_tranches) + 1}"
@@ -293,7 +329,7 @@ class IBKRListener:
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
                             "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
-                            (symbol, tranche_id, side, qty, price, setup_tag),
+                            (symbol, tranche_id, side, qty, price, setup_tag or ("Breakout" if side == "LONG" else "DS")),
                         )
                         new_trade_id = cursor.lastrowid
                         await conn.commit()
@@ -315,15 +351,17 @@ class IBKRListener:
                     had_profit = False
                     had_loss = False
                     remaining_exit_qty = qty
+                    # 🚀 浮点 epsilon 安全边界：防止 IEEE 754 精度穿透
+                    EPS = 1e-6
                     for row in open_tranches:
-                        if remaining_exit_qty <= 0:
+                        if remaining_exit_qty <= EPS:
                             break
                         t_id = row["id"]
                         t_qty = float(row["quantity"])
                         t_entry = float(row["entry_price"])
                         tranche_side = row["side"]
 
-                        if t_qty <= remaining_exit_qty:
+                        if t_qty <= remaining_exit_qty + EPS:
                             cursor = await conn.execute(
                                 "SELECT setup_tag FROM shadow_ledger WHERE id=?", (t_id,)
                             )
@@ -416,6 +454,20 @@ class IBKRListener:
         """
         await asyncio.sleep(3.0)
         try:
+            # 🚀 极速翻仓拦截：3 秒后复查仓位是否还活着
+            async with connect_db() as _check_conn:
+                _check_conn.row_factory = aiosqlite.Row
+                _check_cur = await _check_conn.execute(
+                    "SELECT status, quantity FROM shadow_ledger WHERE id=?", (trade_id,)
+                )
+                _pos = await _check_cur.fetchone()
+                if not _pos or _pos["status"] != "OPEN" or float(_pos["quantity"]) <= 1e-6:
+                    logger.warning(
+                        f"🛑 [极速翻仓拦截] {symbol} (ID:{trade_id}) 在 3 秒内已被平仓，"
+                        f"取消发送 Notion OPEN 事件。"
+                    )
+                    return
+
             # 🛡️ 防抖去重：部分成交会产生多个并发协程，检查 OPEN 任务是否已入队
             async with connect_db() as _dedup_conn:
                 _dedup_cur = await _dedup_conn.execute(
@@ -502,7 +554,11 @@ class IBKRListener:
                                 "entry_price": float(pos_row["entry_price"]),
                                 "initial_stop": db_stop,
                                 "current_stop": db_stop,
-                                "setup_tag": pos_row["setup_tag"] or "",
+                                "setup_tag": (
+                                    pos_row["setup_tag"]
+                                    if pos_row["setup_tag"] in ("Breakout", "EP", "PB", "DS")
+                                    else ("Breakout" if pos_row["side"] == "LONG" else "DS")
+                                ),
                                 "create_time": pos_row["create_time"] or "",
                                 "spy_context": spy_ctx,
                             },

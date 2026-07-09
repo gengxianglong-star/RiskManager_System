@@ -173,6 +173,41 @@ async def outbound_worker(app):
                         # 记录故障 → 熔断器
                         if channel == "notion":
                             notion_breaker.record_failure()
+                            err_msg = str(e)
+
+                            # 🚨 三级 Telegram 报警：根据错误类型精准推送，彻底告别盲盒
+                            try:
+                                if any(kw in err_msg for kw in (
+                                    "body failed validation", "validation_error",
+                                    "Bad Request", "400",
+                                )):
+                                    await app.gateway.notify_user(
+                                        f"⚠️ **Notion 字段验证失败**\n"
+                                        f"标的: `{payload.get('symbol', '?')}`\n"
+                                        f"事件: `{payload.get('event_type', '?')}`\n\n"
+                                        f"Notion 拒绝了数据录入。请检查数据库的**列名**和**属性类型**是否与代码匹配。\n\n"
+                                        f"📋 报错原文:\n`{err_msg[:300]}`"
+                                    )
+                                elif any(kw in err_msg.lower() for kw in (
+                                    "connect", "timeout",
+                                )):
+                                    logger.error(f"Notion 网络阻断: {err_msg[:120]}")
+                                    await app.gateway.notify_user(
+                                        f"🔴 **Notion 连接阻断 (ConnectError)**\n"
+                                        f"检测到代理配置失效或网络不通，请检查 `.env` 中的 HTTP_PROXY。\n"
+                                        f"当前数据已锁定在发件箱，网络恢复后将自动补发。"
+                                    )
+                                elif any(kw in err_msg.lower() for kw in (
+                                    "invalid", "unauthorized", "api token",
+                                )):
+                                    logger.error(f"Notion Token 授权失败: {err_msg[:120]}")
+                                    await app.gateway.notify_user(
+                                        f"🔴 **Notion 授权失效**\n"
+                                        f"API Token 无效或已过期！请前往 Notion Integrations 重新获取并更新 `.env` 中的 `NOTION_TOKEN`。\n"
+                                        f"系统已触发断路器保护，数据安全停留在本地队列中。"
+                                    )
+                            except Exception:
+                                pass
 
                         retry = (row["retry_count"] or 0) + 1
                         await db.execute(
@@ -215,21 +250,47 @@ async def outbound_worker(app):
 async def _send_telegram(app, payload: dict):
     """发送 Telegram 消息。payload 中需含 'message' 字段。"""
     msg = payload.get("message", "")
-    if not msg or app.bot is None:
+    if not msg:
         return
-    from config import MY_TELEGRAM_CHAT_ID
-    await app.bot.send_message(chat_id=MY_TELEGRAM_CHAT_ID, text=msg)
+    await app.gateway.notify_user(msg)
 
 
 @ai_trace
 async def _send_notion(payload: dict, existing_page_id: str = "") -> str:
-    """发送 Notion 页面（创建或更新）。返回 page_id。"""
+    """发送 Notion 页面（创建或更新）。返回 page_id。
+
+    内置 Query Before Create 防重机制：
+    如果本地丢失了 page_id，先根据 Tranche ID 去 Notion 查询，
+    查到已有页面则自动转为 Update，杜绝重复页面。
+    """
     from notion_api import notion, NOTION_DATABASE_ID, _build_notion_properties
 
     if not notion or NOTION_DATABASE_ID == "YOUR_NOTION_DATABASE_ID":
         return ""
 
     props = _build_notion_properties(payload)
+
+    # 🚀 终极防重穿透：本地没有 page_id 时，先去 Notion 查是否有同名 Tranche ID
+    if not existing_page_id and payload.get("event_type") == "OPEN":
+        tranche_name = f"{payload.get('symbol')}-{payload.get('trade_id')}"
+        try:
+            query_result = await notion.databases.query(
+                database_id=NOTION_DATABASE_ID,
+                filter={
+                    "property": "Tranche ID",
+                    "title": {
+                        "equals": tranche_name
+                    }
+                }
+            )
+            if query_result.get("results"):
+                existing_page_id = query_result["results"][0]["id"]
+                logger.info(
+                    f"🔍 [防重拦截] 本地无 page_id，但 Notion 已存在 {tranche_name}，"
+                    f"自动转为 Update 原位覆盖。"
+                )
+        except Exception as e:
+            logger.warning(f"Notion 防重查询失败 (可能被限流或网络抖动)，将按原计划执行: {e}")
 
     if existing_page_id:
         await notion.pages.update(page_id=existing_page_id, properties=props)

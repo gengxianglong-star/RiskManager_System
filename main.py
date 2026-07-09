@@ -120,6 +120,7 @@ from ib_listener import IBKRListener
 from gateway import TelegramGateway
 from scale_out_monitor import ScaleOutMonitor
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.events import EVENT_JOB_ERROR
 
 
 class RiskManagerApp:
@@ -195,9 +196,19 @@ class RiskManagerApp:
     def initialize_background_tasks(self):
         logger.info("🚀 启动工业级后台调度器 (APScheduler) 与常驻守护进程...")
 
+        # 🚀 强制挂载全局错误拦截器，防止定时任务静默死亡
+        def job_error_listener(event):
+            logger.error(
+                f"🚨 [调度器严重故障] 任务 {event.job_id} 崩溃！"
+                f"异常: {repr(event.exception)}"
+            )
+
+        self.scheduler.add_listener(job_error_listener, EVENT_JOB_ERROR)
+
         # ── 常驻轮询型 Worker (asyncio Task：需要持续事件驱动) ──
         self.spawn_background_task(self.ib_listener.keepalive_daemon())
         self.spawn_background_task(self.status_probe_daemon())
+        self.spawn_background_task(self.context_backfill_daemon())
         self.scale_out_monitor = ScaleOutMonitor(self)
         self.spawn_background_task(outbound_worker(self))
 
@@ -280,7 +291,7 @@ class RiskManagerApp:
             )
             rows = await cursor.fetchall()
             for row in rows:
-                if row["setup_tag"] == "IMPORT":
+                if row["setup_tag"] in ("IMPORT", "TWS_SYNC"):
                     msg = f"🚨 物理收编仓位 `{row['symbol']}` 仍在裸奔！\n请尽快发送 `/update {row['symbol']} [止损价]` 补齐防线！"
                 else:
                     msg = f"🚨 越权交易 {row['symbol']} ({row['side']} {row['quantity']:.0f})！请发送 /override {row['symbol']} [坦白理由]！"
@@ -321,6 +332,85 @@ class RiskManagerApp:
             except Exception:
                 pass
             await asyncio.sleep(30)
+
+    async def context_backfill_daemon(self):
+        """补填守护：每 5 分钟扫描 OPEN 仓位，为缺失 SPY Context 的仓位补填大盘环境。
+
+        解决两个场景：
+        1. 对账引擎自动收编的仓位（TWS_SYNC）— 从未抓取过 SPY Context
+        2. 成交回调时因代理瞬断导致 spy_context 为空的仓位
+        """
+        await asyncio.sleep(60)  # 等系统完全就绪
+        while True:
+            try:
+                async with connect_db() as conn:
+                    conn.row_factory = aiosqlite.Row
+                    cur = await conn.execute(
+                        "SELECT id, symbol, entry_price, initial_stop, quantity, side "
+                        "FROM shadow_ledger "
+                        "WHERE status='OPEN' AND (spy_context IS NULL OR spy_context = '')"
+                    )
+                    bare_rows = await cur.fetchall()
+
+                if bare_rows:
+                    # 拉一次 SPY 环境（所有仓位共用）
+                    spy_label, _, _ = await fetch_market_regime()
+                    spy_ctx = spy_label if spy_label and spy_label != REGIME_OFFLINE_LABEL else ""
+
+                    if spy_ctx:
+                        for row in bare_rows:
+                            tid = row["id"]
+                            sym = row["symbol"]
+                            event_key = f"{tid}-UPDATE-SPY"
+
+                            # 更新影子账本
+                            async with connect_db() as conn:
+                                await conn.execute(
+                                    "UPDATE shadow_ledger SET spy_context=? WHERE id=?",
+                                    (spy_ctx, tid),
+                                )
+                                # 查找 OPEN 的 notion_page_id，确保 UPDATE 原位覆盖
+                                cur = await conn.execute(
+                                    "SELECT notion_page_id FROM outbound_queue "
+                                    "WHERE event_key=? AND channel='notion' "
+                                    "AND notion_page_id IS NOT NULL",
+                                    (f"{tid}-OPEN",),
+                                )
+                                page_row = await cur.fetchone()
+                                await conn.commit()
+
+                            # 入队 Notion UPDATE
+                            await enqueue_outbound(
+                                event_key, "notion",
+                                {
+                                    "trade_id": tid,
+                                    "symbol": sym,
+                                    "event_type": "UPDATE",
+                                    "spy_context": spy_ctx,
+                                    "entry_price": float(row["entry_price"]),
+                                    "quantity": float(row["quantity"]),
+                                    "initial_stop": float(row["initial_stop"] or 0),
+                                    "current_stop": float(row["current_stop"] or 0),
+                                },
+                            )
+
+                            # 回写 page_id：确保 worker 走 pages.update 而非 pages.create
+                            if page_row and page_row["notion_page_id"]:
+                                async with connect_db() as conn:
+                                    await conn.execute(
+                                        "UPDATE outbound_queue SET notion_page_id=? "
+                                        "WHERE event_key=? AND channel='notion'",
+                                        (page_row["notion_page_id"], event_key),
+                                    )
+                                    await conn.commit()
+
+                        logger.info(
+                            f"🔄 [上下文回填] 为 {len(bare_rows)} 个仓位补填 SPY Context: {spy_ctx}"
+                        )
+            except Exception as e:
+                logger.warning(f"上下文回填守护异常: {e}")
+
+            await asyncio.sleep(300)  # 每 5 分钟
 
     # 3R 巡检已迁移至 scale_out_monitor.py
 
@@ -549,10 +639,10 @@ async def _pre_init_core() -> None:
     if tws_ok:
         logger.info("✅ TWS 已连接，主客户端(Master Client)全局跨端监听已启动。")
         await asyncio.sleep(1)
-        # ① 先拉 IBKR 交易记录，关闭已平仓的账本条目
-        await app.sync_flex_query_job()
-        # ② 再对账：此时账本已反映最新成交，与 TWS 物理仓位对比
+        # 🚀 恢复开机自动拉取 Flex：MD5 哈希防重 + 1001 静默保护已就绪
+        # 即使频繁重启，也不会触发 IBKR 封禁。开机强拉可第一时间补齐离线期间的结算数据。
         await reconcile_physical_positions(app.ib, tg_gateway.notify_user)
+        app.spawn_background_task(run_flex_settlement(tg_gateway.notify_user))
     else:
         logger.info("⚠️ TWS 未连接，/init 报价与成交同步将不可用。")
 

@@ -247,7 +247,10 @@ async def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price,
 
 
 async def get_today_trade_count(conn) -> int:
-    """获取今日已确认建仓的次数 (狙击手协议)，按 TRADING_TZ 日切。"""
+    """获取今日已确认建仓的次数 (狙击手协议)，按 TRADING_TZ 日切。
+
+    🚨 排除系统自动收编的仓位 (TWS_SYNC / IMPORT)，不消耗每日弹夹额度。
+    """
     tz = ZoneInfo(TRADING_TZ)
     now = datetime.datetime.now(tz)
     day_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
@@ -255,7 +258,9 @@ async def get_today_trade_count(conn) -> int:
     start_utc = day_start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     end_utc = day_end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     cur = await conn.execute(
-        "SELECT COUNT(*) FROM shadow_ledger WHERE create_time >= ? AND create_time < ?",
+        "SELECT COUNT(*) FROM shadow_ledger "
+        "WHERE create_time >= ? AND create_time < ? "
+        "AND setup_tag NOT IN ('TWS_SYNC', 'IMPORT')",
         (start_utc, end_utc),
     )
     row = await cur.fetchone()

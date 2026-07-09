@@ -35,113 +35,115 @@ async def check_notion_online() -> tuple[bool, str]:
         return False, type(exc).__name__
 
 
+def _format_sqlite_date_to_iso(date_str: str) -> str:
+    """将 SQLite 的 YYYY-MM-DD HH:MM:SS 转换为 Notion 要求的 ISO 8601 格式。"""
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        return dt.isoformat() + "+08:00"
+    except Exception:
+        return ""
+
+
 def _build_notion_properties(payload: dict) -> dict:
     """将内部 payload 转为 Notion API properties。
 
     支持三种生命周期：
-    - OPEN:   建仓 — 写入标题/代码/数量/进场价/止损/SPY/Entry Date
+    - OPEN:   建仓 — 写入标题/代码/数量/进场价/止损/SPY/Date
     - UPDATE: 改止损 — 更新 Current Stop / Risk Amount
-    - CLOSE:  平仓结算 — 写入退出价/盈亏/R-Multiple/Return%/Exit Date
+    - CLOSE:  平仓结算 — 写入退出价/盈亏/R-Multiple/Return%
+
+    ⚠️ 属性类型必须与 Notion 数据库列定义严格一致，否则 Notion 返回 400。
     """
-    event = payload.get("event_type", "OPEN")
+    event_type = payload.get("event_type", "OPEN")
     symbol = payload.get("symbol", "UNKNOWN")
     trade_id = payload.get("trade_id", 0)
-    side = payload.get("side", "")
-    qty = float(payload.get("quantity", 0))
-    entry = float(payload.get("entry_price", 0))
-    exit_p = float(payload.get("exit_price", 0))
-    pnl = float(payload.get("realized_pnl", 0))
-    initial_stop = float(payload.get("initial_stop", 0))
-    current_stop = float(payload.get("current_stop", 0))
-    tag = payload.get("setup_tag", "")
-    confession = payload.get("confession", "")
-    spy_ctx = payload.get("spy_context", "")
-    create_time = payload.get("create_time", "")
-    close_type = payload.get("close_type", "Full")
 
-    # ── 风险计算 ──
-    notional = entry * qty
-    risk_amount = 0.0
-    if initial_stop > 0:
-        risk_amount = abs(entry - initial_stop) * qty
-    elif current_stop > 0:
-        risk_amount = abs(entry - current_stop) * qty
-    r_multiple = round(pnl / risk_amount, 2) if risk_amount > 0 else None
-    return_pct = round(pnl / notional * 100, 2) if notional > 0 else None
-
-    properties: dict = {}
+    props: dict = {}
 
     # ── OPEN: 建仓全量字段 ──
-    if event in ("OPEN", "UPDATE"):
-        if event == "OPEN":
-            properties["Tranche ID"] = {
-                "title": [{"text": {"content": f"{symbol}-{trade_id}"}}]
-            }
-            properties["Status"] = {"select": {"name": "OPEN"}}
-        else:
-            properties["Status"] = {"select": {"name": "OPEN"}}
+    if event_type == "OPEN":
+        props["Tranche ID"] = {"title": [{"text": {"content": f"{symbol}-{trade_id}"}}]}
+        props["Symbol"] = {"select": {"name": symbol}}
+        props["Status"] = {"select": {"name": "OPEN"}}
 
-        properties["Symbol"] = {"select": {"name": symbol}}
-        if qty > 0:
-            properties["Quantity"] = {"number": qty}
-        if entry > 0:
-            properties["Entry Price"] = {"number": round(entry, 2)}
-        if side:
-            properties["Side"] = {"select": {"name": str(side).upper()}}
-
-        # 止损字段（始终写入，即使为 0）
-        properties["Initial Stop"] = {"number": round(initial_stop, 2)}
-        properties["Current Stop"] = {"number": round(current_stop, 2)}
-        if risk_amount > 0:
-            properties["Risk Amount"] = {"number": round(risk_amount, 2)}
-
-        # 日期 & 策略 & 环境
-        if create_time:
-            properties["Entry Date"] = {"date": {"start": str(create_time)[:10]}}
-        if tag:
-            tags = [{"name": t.strip()} for t in str(tag).split(",") if t.strip()]
+        if "quantity" in payload:
+            props["Quantity"] = {"number": float(payload["quantity"])}
+        if "entry_price" in payload:
+            props["Entry Price"] = {"number": round(float(payload["entry_price"]), 2)}
+        if "side" in payload:
+            props["Side"] = {"select": {"name": str(payload["side"]).upper()}}
+        if "spy_context" in payload and payload["spy_context"]:
+            props["SPY Context"] = {"rich_text": [{"text": {"content": str(payload["spy_context"])}}]}
+        if "setup_tag" in payload and payload["setup_tag"]:
+            tags = [{"name": t.strip()} for t in str(payload["setup_tag"]).split(",") if t.strip()]
             if tags:
-                properties["Setup Tag"] = {"multi_select": tags}
-        if spy_ctx:
-            properties["SPY Context"] = {"rich_text": [{"text": {"content": str(spy_ctx)}}]}
+                props["Setup Tag"] = {"multi_select": tags}
 
-    # ── CLOSE: 平仓结算 ──
-    if event == "CLOSE":
-        properties["Tranche ID"] = {
-            "title": [{"text": {"content": f"{symbol}-{trade_id}"}}]
-        }
-        properties["Symbol"] = {"select": {"name": symbol}}
-        properties["Status"] = {"select": {"name": "CLOSED"}}
-        if side:
-            properties["Side"] = {"select": {"name": str(side).upper()}}
-        if qty > 0:
-            properties["Quantity"] = {"number": qty}
-        if entry > 0:
-            properties["Entry Price"] = {"number": round(entry, 2)}
+        # 🚨 买入时间：ISO 8601 格式写入 Entry Date 列
+        if "create_time" in payload and payload["create_time"]:
+            iso_date = _format_sqlite_date_to_iso(payload["create_time"])
+            if iso_date:
+                props["Entry Date"] = {"date": {"start": iso_date}}
 
-        properties["Close Type"] = {"select": {"name": close_type}}
-        if exit_p > 0:
-            properties["Exit Price"] = {"number": round(exit_p, 2)}
-        properties["Realized P&L"] = {"number": round(pnl, 2)}
-        if r_multiple is not None:
-            properties["R-Multiple"] = {"number": r_multiple}
-        if return_pct is not None:
-            properties["Return %"] = {"number": return_pct}
-        properties["Exit Date"] = {"date": {"start": datetime.date.today().isoformat()}}
+    # ── OPEN / UPDATE: 止损 + 风险金额 + SPY Context 补填 ──
+    if event_type in ("OPEN", "UPDATE"):
+        entry = float(payload.get("entry_price", 0))
+        qty = float(payload.get("quantity", 0))
+        init_stop = float(payload.get("initial_stop", 0))
+        curr_stop = float(payload.get("current_stop", 0))
 
-        if tag:
-            tags = [{"name": t.strip()} for t in str(tag).split(",") if t.strip()]
-            if tags:
-                properties["Setup Tag"] = {"multi_select": tags}
-        if spy_ctx:
-            properties["SPY Context"] = {"rich_text": [{"text": {"content": str(spy_ctx)}}]}
+        if init_stop > 0:
+            props["Initial Stop"] = {"number": round(init_stop, 2)}
+            if entry > 0:
+                # 🚀 Risk Amount（美元金额）
+                if qty > 0:
+                    risk_amt = abs(entry - init_stop) * qty
+                    props["Risk Amount"] = {"number": round(risk_amt, 2)}
+                # 🚀 Risk %（Notion percent 列，存小数：0.0088 → 显示 0.88%）
+                risk_pct = round(abs(entry - init_stop) / entry, 4)
+                props["Risk %"] = {"number": risk_pct}
 
-    # ── 公共字段 ──
+        if curr_stop > 0:
+            props["Current Stop"] = {"number": round(curr_stop, 2)}
+
+        # 🚀 SPY Context 补填：UPDATE 事件也写入（回填守护专用）
+        if "spy_context" in payload and payload["spy_context"]:
+            props["SPY Context"] = {"rich_text": [{"text": {"content": str(payload["spy_context"])}}]}
+
+        if curr_stop > 0:
+            props["Current Stop"] = {"number": round(curr_stop, 2)}
+
+    # ── CLOSE: 平仓结算（更新已有页面）──
+    if event_type == "CLOSE":
+        props["Status"] = {"select": {"name": "CLOSED"}}
+
+        pnl = float(payload.get("realized_pnl", 0))
+        props["Realized P&L"] = {"number": round(pnl, 2)}
+
+        if "exit_price" in payload:
+            props["Exit Price"] = {"number": float(payload["exit_price"])}
+
+        initial_risk = float(payload.get("initial_risk", 0))
+        if initial_risk > 0 and pnl != 0:
+            props["R-Multiple"] = {"number": round(pnl / initial_risk, 2)}
+
+        entry_p = float(payload.get("entry_price", 0))
+        exit_p = float(payload.get("exit_price", 0))
+        side = payload.get("side", "LONG")
+        if entry_p > 0 and exit_p > 0:
+            if side == "LONG":
+                ret_pct = (exit_p / entry_p - 1)
+            else:
+                ret_pct = (1 - exit_p / entry_p)
+            props["Return %"] = {"number": round(ret_pct, 4)}
+
+    # ── 公共字段：违规标记 ──
+    confession = payload.get("confession", "")
     if confession:
-        properties["Confession"] = {"rich_text": [{"text": {"content": str(confession)}}]}
-        properties["Violation"] = {"checkbox": True}
+        props["Confession"] = {"rich_text": [{"text": {"content": str(confession)}}]}
+        props["Violation"] = {"checkbox": True}
 
-    return properties
+    return props
 
 
 async def enqueue_notion(trade_id: int, symbol: str, event_type: str, **kwargs):

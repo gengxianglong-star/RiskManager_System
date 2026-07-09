@@ -135,14 +135,36 @@ async def reconcile_physical_positions(ib, notify_func=None):
                         if auto_entry <= 0:
                             continue
                         tranche_id = f"T{await count_open_tranches(conn, sym) + 1}"
-                        await conn.execute(
+                        cursor = await conn.execute(
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'IMPORT')",
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'TWS_SYNC')",
                             (sym, tranche_id, auto_side, auto_qty, auto_entry),
                         )
+                        new_trade_id = cursor.lastrowid
                         auto_imported.append(
                             f"📥 {auto_side} {sym} {auto_qty:.0f}股 @ ${auto_entry:.2f}（自动收编）"
+                        )
+                        # 🚀 自动收编也走统一出站：Notion + Telegram 双通道
+                        await enqueue_outbound(
+                            f"{new_trade_id}-OPEN", "telegram",
+                            {"message": f"📥 系统自动收编: {auto_side} {sym} {auto_qty:.0f}股 @ ${auto_entry:.2f}\n(请在 Notion 补齐止损后，通过 TWS 图表设置止损单)"}
+                        )
+                        await enqueue_outbound(
+                            f"{new_trade_id}-OPEN", "notion",
+                            {
+                                "trade_id": new_trade_id,
+                                "symbol": sym,
+                                "event_type": "OPEN",
+                                "side": auto_side,
+                                "quantity": auto_qty,
+                                "entry_price": auto_entry,
+                                "initial_stop": 0.0,
+                                "current_stop": 0.0,
+                                "setup_tag": "TWS_SYNC",
+                                "create_time": "",
+                                "spy_context": "",
+                            },
                         )
                 ghost_alerts.extend(auto_imported)
 
