@@ -654,7 +654,10 @@ async def _post_init_telegram(tg_app: Application) -> None:
         await sync_bot_commands(tg_app)
     except Exception as e:
         logger.info(f"⚠️ Telegram 命令菜单同步失败: {e}")
-    await app.run_daily_boot_checks()
+    try:
+        await app.run_daily_boot_checks()
+    except Exception as e:
+        logger.info(f"⚠️ 开机自检通知发送失败（网络抖动）: {e}")
     if app.ib.isConnected():
         await _notify_system_online("启动")
     else:
