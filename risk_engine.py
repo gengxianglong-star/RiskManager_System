@@ -144,16 +144,7 @@ class RiskEngine:
             if not qualified:
                 return f"❌ 无法验证合约 `{symbol}`。"
 
-            positions = await self.ib_listener.ib.reqPositionsAsync()
-            actual_qty = 0.0
-            for pos in positions:
-                if pos.contract.secType == "STK" and pos.contract.symbol == symbol and pos.position != 0:
-                    actual_qty = float(pos.position)
-                    break
-
-            if actual_qty == 0:
-                return f"ℹ️ {symbol} TWS 实盘持仓已为 0，跳过斩立决。"
-
+            # 1. 撤销所有挂单（异步，避免阻塞事件循环）
             canceled_count = 0
             for trade in self.ib_listener.ib.trades():
                 if trade.contract.symbol == symbol and not trade.isDone():
@@ -162,17 +153,23 @@ class RiskEngine:
 
             if canceled_count > 0:
                 await asyncio.sleep(2.0)
-                positions = await self.ib_listener.ib.reqPositionsAsync()
-                actual_qty = 0.0
-                for pos in positions:
-                    if pos.contract.secType == "STK" and pos.contract.symbol == symbol and pos.position != 0:
-                        actual_qty = float(pos.position)
-                        break
-                if actual_qty == 0:
-                    return (
-                        f"ℹ️ `{symbol}` 在保护撤单期间仓位已被平掉，"
-                        f"已跳过市价单强平环节，避免产生双倍裸空敞口。"
-                    )
+
+            # 2. 无条件重新拉取 TWS 物理仓位——无论是否有挂单被撤
+            #    消除毫秒级时间差带来的多开/裸空风险
+            positions = await self.ib_listener.ib.reqPositionsAsync()
+            actual_qty = 0.0
+            for pos in positions:
+                if pos.contract.secType == "STK" and pos.contract.symbol == symbol and pos.position != 0:
+                    actual_qty = float(pos.position)
+                    break
+
+            if actual_qty == 0:
+                return (
+                    f"ℹ️ `{symbol}` 实盘持仓已为 0（"
+                    + (f"撤单 {canceled_count} 笔后仓位已自动清零。" if canceled_count > 0
+                       else "无需撤单，仓位已平。")
+                    + f"）已跳过市价单强平环节，避免产生双倍裸空敞口。"
+                )
 
             action = "SELL" if actual_qty > 0 else "BUY"
             mkt_order = MarketOrder(action, abs(actual_qty))
@@ -191,8 +188,8 @@ class RiskEngine:
             logger.error(f"斩立决异常: {e}")
             return f"❌ 斩立决发生异常: {e}"
         finally:
-            loop = asyncio.get_running_loop()
-            loop.call_later(10.0, self.ctx.killing_symbols.discard, symbol)
+            # 事务闭环后可靠释放锁，废弃危险的 loop.call_later 10s 硬编码解锁
+            self.ctx.killing_symbols.discard(symbol)
 
     # ── 守夜人（止盈后保本推移）──
 

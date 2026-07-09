@@ -38,7 +38,11 @@ class TelegramGateway:
     async def notify_user(
         self, message: str, parse_mode: str = "Markdown", reply_markup=None, retry: int = 0
     ) -> None:
-        """全局消息推送出口。"""
+        """全局消息推送出口。自带 Telegram 429 限流退避保护与异常阻断。
+
+        所有失败模式在重试耗尽后均抛出异常——不静默丢弃，由上层
+        outbound_worker 捕获后触发出站队列的指数退避 + 死信保护。
+        """
         if not self.bot:
             logger.warning(f"Telegram 未绑定，跳过通知: {message[:80]}...")
             return
@@ -68,7 +72,11 @@ class TelegramGateway:
                 await asyncio.sleep(e.retry_after + 1)
                 await self.notify_user(message, parse_mode, reply_markup, retry + 1)
             else:
-                logger.error("Telegram 连续限流 3 次，消息丢弃。")
+                # 必须抛出异常，阻止 outbound_worker 将消息标记为 'sent'
+                raise RuntimeError(
+                    f"Telegram 连续限流超限（3 次），"
+                    f"主动阻断以触发出站队列退避重试。RetryAfter={e.retry_after}s"
+                )
         except (TimedOut, NetworkError) as e:
             if retry < 3:
                 wait = 2 ** retry
@@ -76,19 +84,16 @@ class TelegramGateway:
                 await asyncio.sleep(wait)
                 await self.notify_user(message, parse_mode, reply_markup, retry + 1)
             else:
-                self._tg_was_offline = True
-                if message not in self._msg_queue:
-                    self._msg_queue.append(message)
-                    if len(self._msg_queue) > 50:
-                        self._msg_queue = self._msg_queue[-30:]
-                logger.warning(f"Telegram 持续不可达，消息已入队 ({len(self._msg_queue)} 条积压)")
+                # 网络彻底不通 → 抛异常，由 outbound_worker 接管重试
+                raise ConnectionError(
+                    f"Telegram 网络连接彻底失败（{type(e).__name__}），"
+                    f"主动阻断以触发出站队列退避重试。"
+                )
         except Exception as e:
-            self._tg_was_offline = True
-            if message not in self._msg_queue:
-                self._msg_queue.append(message)
-                if len(self._msg_queue) > 50:
-                    self._msg_queue = self._msg_queue[-30:]
-            logger.error(f"Telegram 发送异常（已入队）: {type(e).__name__}: {e}")
+            # 未知异常视为致命，立即阻断
+            raise RuntimeError(
+                f"Telegram 发送未知致命异常: {type(e).__name__}: {e}"
+            ) from e
 
     async def _drain_queue(self) -> None:
         """Telegram 恢复时批量推送积压消息。"""

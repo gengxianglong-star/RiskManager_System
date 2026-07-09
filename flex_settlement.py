@@ -213,9 +213,10 @@ async def run_flex_settlement(tg_notify_func=None):
 
                 initial_risk = abs(entry_p - init_stop) * curr_qty if init_stop > 0 else 0.0
 
-                # 权威覆盖
+                # Flex 报表已确认本批次交割完成 → 无条件将 status 置为 CLOSED
+                # 防止 reconciliation 对账引擎将已平仓条目误判为"幽灵单"并覆写 PnL 为 0
                 await db.execute(
-                    "UPDATE shadow_ledger SET exit_price=?, realized_pnl=? "
+                    "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? "
                     "WHERE id=?",
                     (exec_price, new_total_pnl, trade_id),
                 )
