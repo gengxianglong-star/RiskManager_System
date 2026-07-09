@@ -198,6 +198,16 @@ class IBKRListener:
         price = float(execution.price)
         setup_tag = trade.order.orderRef if trade.order and trade.order.orderRef else ""
 
+        # ── 交易日志标准：提取订单元数据 ──
+        exec_time = execution.time.isoformat() if execution.time else ""
+        order_type = trade.order.orderType if trade.order and trade.order.orderType else ""
+        order_tif = trade.order.tif if trade.order and trade.order.tif else ""
+        fill_exchange = execution.exchange if execution and execution.exchange else ""
+        commission = (
+            float(fill.commissionReport.commission)
+            if fill.commissionReport and fill.commissionReport.commission else 0.0
+        )
+
         # ── Kill Switch 平仓 ──
         if setup_tag == "KILL_SWITCH":
             logger.info(f"🛡️ 侦测到 Kill Switch 的平仓回报 [{symbol}]，开始清理账本...")
@@ -232,7 +242,8 @@ class IBKRListener:
                             },
                         )
                     await conn.execute(
-                        "UPDATE shadow_ledger SET status='CLOSED', exit_price=? "
+                        "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, "
+                        "exit_reason='KILL_SWITCH' "
                         "WHERE symbol=? AND status='OPEN'",
                         (price, symbol),
                     )
@@ -265,6 +276,19 @@ class IBKRListener:
                                 break
 
                     equity = await self.fetch_account_equity()
+                    # ── 交易日志：快照入场时风险指标 ──
+                    entry_risk_light, _ = await self.ctx.risk_engine.calculate_risk_light(
+                        conn, equity
+                    )
+                    cur_cl = await conn.execute(
+                        "SELECT value FROM system_state WHERE key='consecutive_losses'"
+                    )
+                    cl_row = await cur_cl.fetchone()
+                    entry_consec_losses = int(cl_row[0]) if cl_row else 0
+                    entry_risk_amount = (
+                        abs(price - stop_for_val) * qty if stop_for_val > 0 else 0.0
+                    )
+
                     reject_reason = await self.ctx.risk_engine.validate_pending_entry(
                         conn, price, stop_for_val, qty, equity, is_buy=(side == "LONG")
                     )
@@ -355,9 +379,18 @@ class IBKRListener:
                         tranche_id = f"T{len(open_tranches) + 1}"
                         cursor = await conn.execute(
                             "INSERT INTO shadow_ledger "
-                            "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
-                            (symbol, tranche_id, side, qty, price, setup_tag or ("Breakout" if side == "LONG" else "DS")),
+                            "(symbol, tranche_id, side, quantity, entry_price, "
+                            "initial_stop, current_stop, status, setup_tag, "
+                            "exec_time, order_type, order_tif, exchange, commissions, "
+                            "risk_amount, entry_equity, risk_light, consec_losses) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, "
+                            "?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                symbol, tranche_id, side, qty, price,
+                                setup_tag or ("Breakout" if side == "LONG" else "DS"),
+                                exec_time, order_type, order_tif, fill_exchange, commission,
+                                entry_risk_amount, equity, entry_risk_light, entry_consec_losses,
+                            ),
                         )
                         new_trade_id = cursor.lastrowid
                         await conn.commit()
@@ -403,15 +436,35 @@ class IBKRListener:
                                 had_loss = True
                             elif actual_pnl > 0:
                                 had_profit = True
+                            # 计算 R-multiple 和持仓天数
+                            t_stop = float(row["current_stop"] or row["initial_stop"] or 0)
+                            t_risk = abs(t_entry - t_stop) * t_qty if t_stop > 0 else 0.0
+                            t_r = round(actual_pnl / t_risk, 2) if t_risk > 0 else 0.0
+                            create_t = row.get("create_time", "")
+                            t_days = 1
+                            if create_t:
+                                try:
+                                    from datetime import datetime as dt
+                                    d1 = dt.strptime(create_t[:10], "%Y-%m-%d")
+                                    d2 = dt.now()
+                                    t_days = max(1, (d2 - d1).days)
+                                except Exception:
+                                    pass
+                            exit_reason = "TARGET" if actual_pnl > 0 else "STOP_HIT"
+
                             await conn.execute(
-                                "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, realized_pnl=? WHERE id=?",
-                                (price, actual_pnl, t_id),
+                                "UPDATE shadow_ledger SET status='CLOSED', "
+                                "exit_price=?, realized_pnl=?, "
+                                "exit_reason=?, r_multiple=?, holding_days=?, "
+                                "risk_amount=COALESCE(risk_amount, ?) "
+                                "WHERE id=?",
+                                (price, actual_pnl, exit_reason, t_r, t_days, t_risk, t_id),
                             )
                             pnl_sign = "+" if actual_pnl > 0 else ""
                             close_msg = (
                                 f"📤 **平仓确认** `{symbol}`\n"
                                 f"{tranche_side} {t_qty:.0f}股 @ ${price:.2f} | "
-                                f"盈亏 {pnl_sign}${actual_pnl:.2f}"
+                                f"盈亏 {pnl_sign}${actual_pnl:.2f} | R={t_r}"
                             )
                             await enqueue_outbound(f"{t_id}-CLOSE", "telegram", {"message": close_msg})
                             await enqueue_outbound(
@@ -530,6 +583,22 @@ class IBKRListener:
                 self.ctx.spawn_background_task(
                     self.ctx.risk_engine.night_watchman_on_tp(trade, execution)
                 )
+
+        # ── 记录 execId 用于 Executions 降级路径去重 ──
+        try:
+            async with connect_db() as dedup_db:
+                await dedup_db.execute(
+                    "CREATE TABLE IF NOT EXISTS fill_processed ("
+                    "exec_id TEXT PRIMARY KEY, "
+                    "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+                )
+                await dedup_db.execute(
+                    "INSERT OR IGNORE INTO fill_processed (exec_id) VALUES (?)",
+                    (execution.execId,),
+                )
+                await dedup_db.commit()
+        except Exception:
+            pass  # 非致命记账，静默降级
 
     # ═══════════════════════════════════════════════════════════
     # 🚀 核心：3 秒延迟止损捕获 → Notion 全量推送

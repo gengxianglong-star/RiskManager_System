@@ -8,7 +8,7 @@ from config import NOTION_DATABASE_ID, NOTION_TOKEN
 from database import connect_db
 
 notion = (
-    AsyncClient(auth=NOTION_TOKEN)
+    AsyncClient(auth=NOTION_TOKEN, notion_version="2022-06-28")
     if NOTION_TOKEN and NOTION_TOKEN != "YOUR_NOTION_TOKEN"
     else None
 )

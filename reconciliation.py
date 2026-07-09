@@ -142,6 +142,7 @@ async def reconcile_physical_positions(ib, notify_func=None):
                             (sym, tranche_id, auto_side, auto_qty, auto_entry),
                         )
                         new_trade_id = cursor.lastrowid
+                        await conn.commit()  # 释放写锁后再调用出站队列，防止 database is locked
                         auto_imported.append(
                             f"📥 {auto_side} {sym} {auto_qty:.0f}股 @ ${auto_entry:.2f}（自动收编）"
                         )
@@ -243,6 +244,7 @@ async def reconcile_physical_positions(ib, notify_func=None):
                             "UPDATE shadow_ledger SET current_stop=?, initial_stop=? WHERE id=?",
                             (stop_price, new_init, row["id"]),
                         )
+                        await conn.commit()  # 释放写锁后再调用出站队列，防止 database is locked
                         stop_sync_log.append(
                             f"🛡️ {sym} 止损已兜底同步: "
                             + (f"${stop_price:.2f} (新增防线)" if old_init == 0.0 else f"${stop_price:.2f}")

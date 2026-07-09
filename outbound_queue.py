@@ -275,12 +275,15 @@ async def _send_notion(payload: dict, existing_page_id: str = "") -> str:
     if not existing_page_id and payload.get("event_type") == "OPEN":
         tranche_name = f"{payload.get('symbol')}-{payload.get('trade_id')}"
         try:
-            query_result = await notion.databases.query(
-                database_id=NOTION_DATABASE_ID,
-                filter={
-                    "property": "Tranche ID",
-                    "title": {
-                        "equals": tranche_name
+            query_result = await notion.request(
+                path=f"databases/{NOTION_DATABASE_ID}/query",
+                method="POST",
+                body={
+                    "filter": {
+                        "property": "Tranche ID",
+                        "title": {
+                            "equals": tranche_name
+                        }
                     }
                 }
             )

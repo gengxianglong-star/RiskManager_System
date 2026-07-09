@@ -245,10 +245,27 @@ class RiskEngine:
                     continue
                 self.ib_listener.ib.placeOrder(open_trade.contract, stop_order)
                 async with connect_db() as conn:
+                    # 获取 ledger_id 用于止损日志
+                    cur_sl = await conn.execute(
+                        "SELECT id FROM shadow_ledger "
+                        "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC LIMIT 1",
+                        (symbol,),
+                    )
+                    sl_row = await cur_sl.fetchone()
+                    ledger_id = sl_row["id"] if sl_row else None
+
                     await conn.execute(
                         "UPDATE shadow_ledger SET current_stop=? WHERE symbol=? AND status='OPEN'",
                         (entry_price, symbol),
                     )
+                    # 止损调整日志
+                    if ledger_id:
+                        await conn.execute(
+                            "INSERT INTO stop_adjustments "
+                            "(ledger_id, old_stop, new_stop, reason, triggered_by) "
+                            "VALUES (?, ?, ?, 'BREAKEVEN', 'night_watchman')",
+                            (ledger_id, old_stop, entry_price),
+                        )
                     await conn.commit()
                 await enqueue_outbound(
                     f"{trade.order.permId}-STOP_BREAKEVEN", "telegram",

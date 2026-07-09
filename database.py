@@ -59,10 +59,35 @@ async def ensure_schema() -> None:
             """
         )
 
+        # ====== 交易日志标准：扩展 shadow_ledger 列（全部 DEFAULT，向后兼容）======
+        _journal_cols = [
+            ("order_type", "TEXT DEFAULT ''"),
+            ("order_tif", "TEXT DEFAULT ''"),
+            ("exec_time", "TEXT DEFAULT ''"),
+            ("exchange", "TEXT DEFAULT ''"),
+            ("risk_amount", "REAL DEFAULT 0.0"),
+            ("entry_equity", "REAL DEFAULT 0.0"),
+            ("risk_light", "TEXT DEFAULT ''"),
+            ("consec_losses", "INTEGER DEFAULT 0"),
+            ("exit_reason", "TEXT DEFAULT ''"),
+            ("r_multiple", "REAL DEFAULT 0.0"),
+            ("holding_days", "INTEGER DEFAULT 0"),
+            ("commissions", "REAL DEFAULT 0.0"),
+            ("mae_pct", "REAL DEFAULT 0.0"),
+            ("mfe_pct", "REAL DEFAULT 0.0"),
+            ("journal_note", "TEXT DEFAULT ''"),
+        ]
+        for col_name, col_def in _journal_cols:
+            try:
+                await db.execute(f"ALTER TABLE shadow_ledger ADD COLUMN {col_name} {col_def}")
+            except Exception:
+                pass  # 列已存在，跳过
+
         # ====== 关键复合索引：防止表膨胀后 I/O 阻塞 ======
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_status ON shadow_ledger(status);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_symbol_status ON shadow_ledger(symbol, status);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_create_time ON shadow_ledger(create_time);")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_ledger_exit_reason ON shadow_ledger(exit_reason);")
 
         await db.execute(
             """
@@ -177,6 +202,78 @@ async def ensure_schema() -> None:
             await db.execute("ALTER TABLE outbound_queue ADD COLUMN notion_page_id TEXT")
         except Exception:
             pass
+
+        # ═══════════════════════════════════════════════════════════
+        # 交易日志标准：4 张新表
+        # ═══════════════════════════════════════════════════════════
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stop_adjustments (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_id     INTEGER NOT NULL REFERENCES shadow_ledger(id),
+                old_stop      REAL NOT NULL,
+                new_stop      REAL NOT NULL,
+                reason        TEXT NOT NULL,
+                triggered_by  TEXT DEFAULT '',
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stop_adj_ledger ON stop_adjustments(ledger_id)"
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_tags (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_id INTEGER NOT NULL REFERENCES shadow_ledger(id),
+                tag       TEXT NOT NULL,
+                UNIQUE(ledger_id, tag)
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tags_ledger ON trade_tags(ledger_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tags_tag ON trade_tags(tag)"
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_snapshots (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_id      INTEGER UNIQUE NOT NULL REFERENCES shadow_ledger(id),
+                spy_price      REAL,
+                spy_volume     REAL,
+                vix            REAL,
+                sector         TEXT DEFAULT '',
+                market_regime  TEXT DEFAULT '',
+                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_reviews (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                ledger_id        INTEGER UNIQUE NOT NULL REFERENCES shadow_ledger(id),
+                grade            INTEGER CHECK(grade BETWEEN 1 AND 5),
+                followed_plan    INTEGER DEFAULT 0,
+                mistake          TEXT DEFAULT '',
+                lesson           TEXT DEFAULT '',
+                screenshot_entry TEXT DEFAULT '',
+                screenshot_exit  TEXT DEFAULT '',
+                emotion_entry    TEXT DEFAULT '',
+                emotion_exit     TEXT DEFAULT '',
+                reviewed_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         await db.commit()
 
 

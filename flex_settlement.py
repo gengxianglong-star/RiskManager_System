@@ -16,12 +16,23 @@ import datetime
 import hashlib
 
 import pandas_market_calendars as mcal
-from ib_insync import FlexReport
+from ib_insync import ExecutionFilter, FlexReport
+from ib_insync.util import formatIBDatetime
 
 from ai_logger import ai_trace, logger
 from config import FLEX_QUERY_ID, FLEX_TOKEN
 from database import connect_db
 from outbound_queue import enqueue_outbound
+
+
+# ── Executions 回退引擎内部锁池（避免循环引用 main.py）──
+_fallback_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_fallback_lock(symbol: str) -> asyncio.Lock:
+    if symbol not in _fallback_locks:
+        _fallback_locks[symbol] = asyncio.Lock()
+    return _fallback_locks[symbol]
 
 
 def _flex_trade_attr(trade, *names, default=""):
@@ -31,6 +42,242 @@ def _flex_trade_attr(trade, *names, default=""):
         if val is not None and val != "":
             return val
     return default
+
+
+@ai_trace
+async def _run_executions_fallback(ib, tg_notify_func) -> None:
+    """Flex 降级路径：当 Flex 1001/1025 限流时，从 TWS 拉取成交记录。
+
+    按时间排序后逐笔回放，复刻实时监听的 FIFO 开平仓逻辑，
+    跳过风控校验（历史成交已成事实），仅做账本核销 + Notion 同步。
+    """
+    logger.info("🔄 [Executions Fallback] 启动 TWS 成交记录应急通道...")
+
+    # ── Phase 0: 拉取近 5 天 STK 成交 ──
+    start = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=5)
+    try:
+        fills = await ib.reqExecutionsAsync(
+            ExecutionFilter(time=formatIBDatetime(start))
+        )
+    except Exception as e:
+        logger.error(f"Executions 应急通道拉取失败: {e}")
+        if tg_notify_func:
+            await tg_notify_func(
+                f"⚠️ Executions 应急通道也失败了: {type(e).__name__}\n"
+                f"Flex 限流 + Executions 失败，本轮结算完全跳过。"
+            )
+        return
+
+    # 仅保留有效 STK 成交
+    fills = [
+        f for f in fills
+        if f.contract.secType == "STK"
+        and float(f.execution.shares) > 0
+        and f.contract.symbol
+    ]
+    if not fills:
+        logger.info("Executions 无有效 STK 成交记录。")
+        return
+
+    # ── Phase 1: 去重 + 排序 ──
+    async with connect_db() as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS fill_processed ("
+            "exec_id TEXT PRIMARY KEY, "
+            "processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "DELETE FROM fill_processed WHERE processed_at < datetime('now', '-30 days')"
+        )
+
+        new_fills = []
+        for f in fills:
+            cur = await db.execute(
+                "SELECT 1 FROM fill_processed WHERE exec_id=?",
+                (f.execution.execId,),
+            )
+            if not await cur.fetchone():
+                new_fills.append(f)
+
+        if not new_fills:
+            logger.info("Executions 无新成交记录（全部已处理）。")
+            return
+
+        # Phase 2: 按时间升序（确保 FIFO 语义正确）
+        new_fills.sort(key=lambda f: f.execution.time)
+        logger.info(f"Executions 发现 {len(new_fills)} 笔新成交待处理...")
+
+        # ── Phase 3: 逐笔回放 ──
+        db.row_factory = lambda cursor, row: dict(
+            zip([c[0] for c in cursor.description], row)
+        )
+        opens_count = 0
+        closes_count = 0
+        EPS = 1e-6
+
+        for fill in new_fills:
+            symbol = fill.contract.symbol
+            exec_id = fill.execution.execId
+            side = "LONG" if fill.execution.side == "BOT" else "SHORT"
+            qty = float(fill.execution.shares)
+            price = float(fill.execution.price)
+
+            lock = _get_fallback_lock(symbol)
+            async with lock:
+                # 查当前 OPEN 仓位
+                cur = await db.execute(
+                    "SELECT id, side, quantity, entry_price, current_stop, "
+                    "realized_pnl, setup_tag FROM shadow_ledger "
+                    "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
+                    (symbol,),
+                )
+                open_rows = await cur.fetchall()
+                opening = not open_rows or open_rows[0]["side"] == side
+
+                if opening:
+                    # ── 开仓 / 同向加仓 ──
+                    tranche_id = f"T{len(open_rows) + 1}"
+                    cur = await db.execute(
+                        "INSERT INTO shadow_ledger "
+                        "(symbol, tranche_id, side, quantity, entry_price, "
+                        "initial_stop, current_stop, status, setup_tag) "
+                        "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                        (symbol, tranche_id, side, qty, price, "EXEC_FALLBACK"),
+                    )
+                    new_id = cur.lastrowid
+                    await db.commit()  # 释放写锁，允许 enqueue_outbound 写入
+                    await enqueue_outbound(
+                        f"{new_id}-OPEN", "notion",
+                        {
+                            "trade_id": new_id, "symbol": symbol,
+                            "event_type": "OPEN", "side": side,
+                            "quantity": qty, "entry_price": price,
+                            "initial_stop": 0.0, "current_stop": 0.0,
+                            "setup_tag": "EXEC_FALLBACK",
+                        },
+                    )
+                    opens_count += 1
+
+                else:
+                    # ── 平仓 FIFO 核销 ──
+                    remaining = qty
+                    for row in open_rows:
+                        if remaining <= EPS:
+                            break
+                        t_id = row["id"]
+                        t_qty = float(row["quantity"])
+                        t_entry = float(row["entry_price"])
+                        t_side = row["side"]
+                        t_tag = row["setup_tag"] or ""
+
+                        # 竞态保护：确认仓位仍 OPEN
+                        chk = await db.execute(
+                            "SELECT quantity FROM shadow_ledger "
+                            "WHERE id=? AND status='OPEN'",
+                            (t_id,),
+                        )
+                        if not await chk.fetchone():
+                            continue
+                        db_qty = float((await db.execute(
+                            "SELECT quantity FROM shadow_ledger WHERE id=?",
+                            (t_id,),
+                        )).fetchone()["quantity"])
+
+                        actual_qty = min(db_qty, remaining)
+
+                        if t_side == "LONG":
+                            pnl = (price - t_entry) * actual_qty
+                        else:
+                            pnl = (t_entry - price) * actual_qty
+
+                        if db_qty <= remaining + EPS:
+                            # 全额平仓
+                            await db.execute(
+                                "UPDATE shadow_ledger SET status='CLOSED', "
+                                "exit_price=?, realized_pnl=COALESCE(realized_pnl,0)+?, "
+                                "exit_reason='EXEC_FALLBACK' "
+                                "WHERE id=?",
+                                (price, pnl, t_id),
+                            )
+                            await db.commit()
+                            await enqueue_outbound(
+                                f"{t_id}-CLOSE", "notion",
+                                {
+                                    "trade_id": t_id, "symbol": symbol,
+                                    "event_type": "CLOSE", "side": t_side,
+                                    "quantity": db_qty, "entry_price": t_entry,
+                                    "exit_price": price, "realized_pnl": pnl,
+                                    "setup_tag": t_tag,
+                                },
+                            )
+                        else:
+                            # 部分平仓
+                            new_qty = db_qty - remaining
+                            await db.execute(
+                                "UPDATE shadow_ledger SET quantity=?, "
+                                "realized_pnl=COALESCE(realized_pnl,0)+? "
+                                "WHERE id=?",
+                                (new_qty, pnl, t_id),
+                            )
+                            await db.commit()
+                            await enqueue_outbound(
+                                f"{t_id}-UPDATE", "notion",
+                                {
+                                    "trade_id": t_id, "symbol": symbol,
+                                    "event_type": "UPDATE",
+                                    "quantity": new_qty,
+                                    "realized_pnl": pnl,
+                                    "entry_price": t_entry,
+                                    "side": t_side,
+                                },
+                            )
+
+                        remaining -= actual_qty
+                        closes_count += 1
+
+                    # 卖超检测：FIFO 耗尽仍有剩余 → 反向开仓
+                    if remaining > EPS:
+                        rev_side = side
+                        cur = await db.execute(
+                            "INSERT INTO shadow_ledger "
+                            "(symbol, tranche_id, side, quantity, entry_price, "
+                            "initial_stop, current_stop, status, setup_tag) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                            (symbol, f"T_EXEC_REV", rev_side, remaining, price,
+                             "EXEC_FALLBACK"),
+                        )
+                        rev_id = cur.lastrowid
+                        await db.commit()
+                        await enqueue_outbound(
+                            f"{rev_id}-OPEN", "notion",
+                            {
+                                "trade_id": rev_id, "symbol": symbol,
+                                "event_type": "OPEN", "side": rev_side,
+                                "quantity": remaining, "entry_price": price,
+                                "initial_stop": 0.0, "current_stop": 0.0,
+                                "setup_tag": "EXEC_FALLBACK",
+                            },
+                        )
+                        opens_count += 1
+
+                # 标记成交已处理
+                await db.execute(
+                    "INSERT OR IGNORE INTO fill_processed (exec_id) VALUES (?)",
+                    (exec_id,),
+                )
+
+        await db.commit()
+
+    # ── Phase 4: 汇总通知 ──
+    parts = [f"🔄 **Executions 应急通道完成**（Flex 降级）"]
+    if opens_count:
+        parts.append(f"📥 导入/翻仓 {opens_count} 笔")
+    if closes_count:
+        parts.append(f"📤 关仓核销 {closes_count} 笔")
+    msg = "\n".join(parts)
+    logger.info(msg.replace("\n", " | "))
+    if tg_notify_func:
+        await tg_notify_func(msg)
 
 
 @ai_trace
@@ -75,8 +322,19 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
             if any(kw in err_msg for kw in ("1001", "1025")):
                 logger.warning(
                     f"⚠️ Flex 报表遭遇 IBKR 限流 ({err_msg[:60]})，"
-                    f"系统将跳过本次对账，等待下次定时任务自动重试。"
+                    f"自动降级为 Executions 应急通道..."
                 )
+                if ib and ib.isConnected():
+                    try:
+                        await _run_executions_fallback(ib, tg_notify_func)
+                    except Exception as fallback_e:
+                        logger.error(f"Executions 应急通道异常: {fallback_e}")
+                        if tg_notify_func:
+                            await tg_notify_func(
+                                f"⚠️ Executions 应急通道异常: {type(fallback_e).__name__}"
+                            )
+                else:
+                    logger.warning("TWS 未连接，无法启动 Executions 应急通道。")
                 return
             retryable = any(kw in err_msg.lower() for kw in (
                 "could not be generated", "ssl", "eof",
@@ -259,11 +517,18 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
                 is_fully_closed = new_qty <= 1e-4
                 new_status = "CLOSED" if is_fully_closed else "OPEN"
 
-                await db.execute(
-                    "UPDATE shadow_ledger SET status=?, exit_price=?, quantity=?, "
-                    "realized_pnl=? WHERE id=?",
-                    (new_status, exec_price, new_qty, new_total_pnl, trade_id),
-                )
+                if is_fully_closed:
+                    await db.execute(
+                        "UPDATE shadow_ledger SET status=?, exit_price=?, quantity=?, "
+                        "realized_pnl=?, exit_reason='FLEX_CLOSE' WHERE id=?",
+                        (new_status, exec_price, new_qty, new_total_pnl, trade_id),
+                    )
+                else:
+                    await db.execute(
+                        "UPDATE shadow_ledger SET status=?, exit_price=?, quantity=?, "
+                        "realized_pnl=? WHERE id=?",
+                        (new_status, exec_price, new_qty, new_total_pnl, trade_id),
+                    )
 
                 initial_risk = abs(entry_p - init_stop) * db_qty if init_stop > 0 else 0.0
                 event_type = "CLOSE" if is_fully_closed else "UPDATE"
