@@ -20,8 +20,8 @@ from ib_insync import ExecutionFilter, FlexReport
 from ib_insync.util import formatIBDatetime
 
 from ai_logger import ai_trace, logger
-from config import FLEX_QUERY_ID, FLEX_TOKEN
-from database import connect_db
+from config import CLIENT_ID, FLEX_QUERY_IDS, FLEX_TOKEN, TWS_HOST, resolve_tws_ports
+from database import connect_db, compute_close_journal
 from outbound_queue import enqueue_outbound
 
 
@@ -127,12 +127,19 @@ async def _run_executions_fallback(ib, tg_notify_func) -> None:
                 # 查当前 OPEN 仓位
                 cur = await db.execute(
                     "SELECT id, side, quantity, entry_price, current_stop, "
-                    "realized_pnl, setup_tag FROM shadow_ledger "
+                    "realized_pnl, setup_tag, initial_stop, create_time "
+                    "FROM shadow_ledger "
                     "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
                     (symbol,),
                 )
                 open_rows = await cur.fetchall()
                 opening = not open_rows or open_rows[0]["side"] == side
+
+                exec_time_val = (
+                    fill.execution.time.isoformat()
+                    if fill.execution.time else ""
+                )
+                exchange_val = getattr(fill.execution, "exchange", "") or ""
 
                 if opening:
                     # ── 开仓 / 同向加仓 ──
@@ -140,9 +147,11 @@ async def _run_executions_fallback(ib, tg_notify_func) -> None:
                     cur = await db.execute(
                         "INSERT INTO shadow_ledger "
                         "(symbol, tranche_id, side, quantity, entry_price, "
-                        "initial_stop, current_stop, status, setup_tag) "
-                        "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
-                        (symbol, tranche_id, side, qty, price, "EXEC_FALLBACK"),
+                        "initial_stop, current_stop, status, setup_tag, "
+                        "exec_time, exchange) "
+                        "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, ?, ?)",
+                        (symbol, tranche_id, side, qty, price,
+                         "EXEC_FALLBACK", exec_time_val, exchange_val),
                     )
                     new_id = cur.lastrowid
                     await db.commit()  # 释放写锁，允许 enqueue_outbound 写入
@@ -169,6 +178,8 @@ async def _run_executions_fallback(ib, tg_notify_func) -> None:
                         t_entry = float(row["entry_price"])
                         t_side = row["side"]
                         t_tag = row["setup_tag"] or ""
+                        t_stop = float(row.get("initial_stop") or 0)
+                        t_create = row.get("create_time", "") or ""
 
                         # 竞态保护：确认仓位仍 OPEN
                         chk = await db.execute(
@@ -192,12 +203,16 @@ async def _run_executions_fallback(ib, tg_notify_func) -> None:
 
                         if db_qty <= remaining + EPS:
                             # 全额平仓
+                            exit_reason, t_r, t_days = compute_close_journal(
+                                t_entry, t_stop, actual_qty, pnl, t_create, exec_time_val,
+                            )
                             await db.execute(
                                 "UPDATE shadow_ledger SET status='CLOSED', "
                                 "exit_price=?, realized_pnl=COALESCE(realized_pnl,0)+?, "
-                                "exit_reason='EXEC_FALLBACK' "
-                                "WHERE id=?",
-                                (price, pnl, t_id),
+                                "exit_reason=?, r_multiple=?, holding_days=?, "
+                                "exit_time=? WHERE id=?",
+                                (price, pnl, exit_reason, t_r, t_days,
+                                 exec_time_val, t_id),
                             )
                             await db.commit()
                             await enqueue_outbound(
@@ -241,10 +256,11 @@ async def _run_executions_fallback(ib, tg_notify_func) -> None:
                         cur = await db.execute(
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, "
-                            "initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                            "initial_stop, current_stop, status, setup_tag, "
+                            "exec_time, exchange) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, ?, ?)",
                             (symbol, f"T_EXEC_REV", rev_side, remaining, price,
-                             "EXEC_FALLBACK"),
+                             "EXEC_FALLBACK", exec_time_val, exchange_val),
                         )
                         rev_id = cur.lastrowid
                         await db.commit()
@@ -290,7 +306,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
     阶段 2 — 持仓同步：PnL=0 的未平仓交易，拉取 TWS 实时仓位对比，
               股数/成本不匹配则 Notion UPDATE，账本缺失则自动导入 + Notion OPEN。
     """
-    if FLEX_TOKEN.startswith("YOUR_") or FLEX_QUERY_ID.startswith("YOUR_"):
+    if FLEX_TOKEN.startswith("YOUR_") or not FLEX_QUERY_IDS:
         logger.info("未配置 Flex Token / Query ID，跳过权威结算。")
         return
 
@@ -305,54 +321,84 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
         logger.info("近期无有效交易日，跳过 Flex 结算。")
         return
 
-    logger.info("🧾 [Flex Settlement] 开始拉取 IBKR 官方结算报表...")
+    logger.info(f"🧾 [Flex Settlement] 开始拉取 IBKR 官方结算报表 (轮询池: {len(FLEX_QUERY_IDS)} 个 Query)...")
 
     loop = asyncio.get_running_loop()
     report = None
 
-    # ── 独立重试：Flex 特有的 1001 / 延迟生成 / SSL / 超时 ──
-    for flex_attempt in range(3):
-        try:
-            report = await loop.run_in_executor(
-                None, lambda: FlexReport(FLEX_TOKEN, FLEX_QUERY_ID)
-            )
-            break
-        except Exception as fe:
-            err_msg = str(fe)
-            if any(kw in err_msg for kw in ("1001", "1025")):
-                logger.warning(
-                    f"⚠️ Flex 报表遭遇 IBKR 限流 ({err_msg[:60]})，"
-                    f"自动降级为 Executions 应急通道..."
+    # ── Query ID 轮询池：逐个尝试，限流时自动切换下一个（带退避延迟）──
+    for idx, qid in enumerate(FLEX_QUERY_IDS):
+        rate_limited = False
+        for flex_attempt in range(2):
+            try:
+                report = await loop.run_in_executor(
+                    None, lambda q=qid: FlexReport(FLEX_TOKEN, q)
                 )
-                if ib and ib.isConnected():
-                    try:
-                        await _run_executions_fallback(ib, tg_notify_func)
-                    except Exception as fallback_e:
-                        logger.error(f"Executions 应急通道异常: {fallback_e}")
-                        if tg_notify_func:
-                            await tg_notify_func(
-                                f"⚠️ Executions 应急通道异常: {type(fallback_e).__name__}"
-                            )
+                logger.info(f"🧾 [Flex] Query {qid} 成功拉取报表")
+                break
+            except Exception as fe:
+                err_msg = str(fe)
+                if any(kw in err_msg for kw in ("1001", "1025", "1019")):
+                    rate_limited = True
+                    logger.warning(
+                        f"⚠️ Query {qid} 限流 ({err_msg[:60]})，"
+                        f"切换轮询池下一个..."
+                    )
+                    break  # 跳出内层重试，尝试下一个 Query ID
+                retryable = any(kw in err_msg.lower() for kw in (
+                    "could not be generated", "ssl", "eof",
+                    "timeout", "connection",
+                ))
+                if retryable and flex_attempt < 1:
+                    wait = 20 * (flex_attempt + 1)
+                    logger.warning(
+                        f"Flex 报表未就绪 (Query {qid}): {err_msg[:80]}... "
+                        f"{wait}s 后重试 ({flex_attempt + 1}/2)"
+                    )
+                    await asyncio.sleep(wait)
                 else:
-                    logger.warning("TWS 未连接，无法启动 Executions 应急通道。")
-                return
-            retryable = any(kw in err_msg.lower() for kw in (
-                "could not be generated", "ssl", "eof",
-                "timeout", "connection",
-            ))
-            if retryable:
-                wait = 20 * (flex_attempt + 1)
-                logger.warning(
-                    f"Flex 报表未就绪: {err_msg[:80]}... "
-                    f"{wait}s 后重试 ({flex_attempt + 1}/3)"
-                )
-                await asyncio.sleep(wait)
-            else:
-                logger.error(f"Flex 报表致命错误: {err_msg}")
-                return
+                    logger.error(f"Flex 报表致命错误 (Query {qid}): {err_msg}")
+                    break  # 放弃当前 query_id
+        if report is not None:
+            break  # 成功，退出轮询
+        # ── 退避延迟：非最后一个 Query 且触发限流 → 等 5s 避免打满 Token 速率 ──
+        if rate_limited and idx < len(FLEX_QUERY_IDS) - 1:
+            logger.info(f"⏳ Query {qid} 触发限流，等待 5s 冷却后再试下一个...")
+            await asyncio.sleep(5.0)
 
+    # ── 所有 Query ID 均失败 → 降级为 Executions 应急通道 ──
     if report is None:
-        logger.error("❌ Flex 报表 3 次重试均未就绪，本轮结算取消。")
+        logger.warning("⚠️ 所有 Query ID 均限流或失败，自动降级为 Executions 应急通道...")
+
+        # ── 自愈重连：TWS 断线时尝试强制唤醒，打破单点故障 ──
+        connected = ib and ib.isConnected()
+        if ib and not connected:
+            logger.warning("🔄 侦测到 TWS 断开，尝试自愈重连...")
+            try:
+                paper_port, live_port, mode = resolve_tws_ports()
+                port = live_port if mode == "live" else paper_port
+                await ib.connectAsync(TWS_HOST, port, clientId=CLIENT_ID, timeout=15)
+                connected = True
+                logger.info(f"✅ TWS 自愈重连成功 ({TWS_HOST}:{port})")
+            except Exception as conn_err:
+                logger.error(f"❌ TWS 自愈重连失败: {conn_err}")
+
+        if connected:
+            try:
+                await _run_executions_fallback(ib, tg_notify_func)
+            except Exception as fallback_e:
+                logger.error(f"Executions 应急通道异常: {fallback_e}")
+                if tg_notify_func:
+                    await tg_notify_func(
+                        f"⚠️ Executions 应急通道异常: {type(fallback_e).__name__}"
+                    )
+        else:
+            logger.warning("TWS 未连接且重连失败，无法启动 Executions 应急通道。")
+            if tg_notify_func:
+                await tg_notify_func(
+                    "🚨 **清算引擎警报**\n"
+                    "Flex 报表全部限流且 TWS 失去连接，今日账本未能对齐！"
+                )
         return
 
     trades = report.extract("Trade")
@@ -446,7 +492,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
             # 查询影子账本 OPEN 仓位
             cur = await db.execute(
                 "SELECT id, setup_tag, entry_price, initial_stop, quantity, side, "
-                "realized_pnl FROM shadow_ledger "
+                "realized_pnl, create_time FROM shadow_ledger "
                 "WHERE symbol=? AND status='OPEN' ORDER BY create_time ASC",
                 (symbol,),
             )
@@ -509,6 +555,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
                 db_qty = float(row["quantity"])
                 pos_side = row["side"]
                 old_pnl = float(row["realized_pnl"] or 0.0)
+                t_create = row.get("create_time", "") or ""
 
                 close_qty = min(db_qty, remaining_qty)
                 portion_pnl = trade_pnl * (close_qty / flex_qty) if flex_qty > 0 else trade_pnl
@@ -518,10 +565,16 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
                 new_status = "CLOSED" if is_fully_closed else "OPEN"
 
                 if is_fully_closed:
+                    exit_time_flex = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    exit_reason, t_r, t_days = compute_close_journal(
+                        entry_p, init_stop, close_qty, portion_pnl, t_create, exit_time_flex,
+                    )
                     await db.execute(
                         "UPDATE shadow_ledger SET status=?, exit_price=?, quantity=?, "
-                        "realized_pnl=?, exit_reason='FLEX_CLOSE' WHERE id=?",
-                        (new_status, exec_price, new_qty, new_total_pnl, trade_id),
+                        "realized_pnl=?, exit_reason=?, r_multiple=?, holding_days=?, "
+                        "exit_time=? WHERE id=?",
+                        (new_status, exec_price, new_qty, new_total_pnl,
+                         exit_reason, t_r, t_days, exit_time_flex, trade_id),
                     )
                 else:
                     await db.execute(
@@ -636,12 +689,13 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
                 if tws_avg <= 0:
                     continue
                 tranche_id = "T1"
+                exec_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 cur = await db.execute(
                     "INSERT INTO shadow_ledger "
                     "(symbol, tranche_id, side, quantity, entry_price, "
-                    "initial_stop, current_stop, status, setup_tag) "
-                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'FLEX_SYNC')",
-                    (symbol, tranche_id, tws_side, tws_qty, tws_avg),
+                    "initial_stop, current_stop, status, setup_tag, exec_time) "
+                    "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'FLEX_SYNC', ?)",
+                    (symbol, tranche_id, tws_side, tws_qty, tws_avg, exec_now),
                 )
                 new_id = cur.lastrowid
                 await enqueue_outbound(

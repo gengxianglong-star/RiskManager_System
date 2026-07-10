@@ -13,7 +13,7 @@ from ib_insync import Stock
 
 from ai_logger import ai_trace, logger
 from config import CLIENT_ID, TRADING_TZ, TWS_HOST, resolve_tws_ports
-from database import connect_db
+from database import connect_db, compute_close_journal
 from market_regime import fetch_market_regime
 from outbound_queue import enqueue_outbound
 
@@ -152,19 +152,52 @@ class IBKRListener:
         return None, ""
 
     async def fetch_account_equity(self) -> float:
+        summary = await self.fetch_account_summary()
+        return summary.get("net_liquidation", 0.0)
+
+    async def fetch_account_summary(self) -> dict:
+        """全量账户快照：净值/保证金/购买力/杠杆/盈亏/缓冲率。
+
+        返回 dict，键值包含所有关键 accountSummary 字段。
+        """
         if not await self.ensure_connected():
-            return 0.0
+            return {}
+
         try:
             tags = await self.ib.accountSummaryAsync()
-            for row in tags:
-                if row.tag == "NetLiquidation" and row.currency == "USD":
-                    try:
-                        return float(row.value)
-                    except ValueError:
-                        pass
         except Exception as e:
-            logger.warning(f"净值读取失败: {e}")
-        return 0.0
+            logger.warning(f"账户快照获取失败: {e}")
+            return {}
+
+        result = {}
+        for row in tags:
+            if row.currency != "USD" and row.tag not in ("Cushion",):
+                continue
+            try:
+                val = float(row.value)
+            except (ValueError, TypeError):
+                continue
+
+            tag_map = {
+                "NetLiquidation":          "net_liquidation",
+                "ExcessLiquidity":         "excess_liquidity",
+                "BuyingPower":             "buying_power",
+                "InitMarginReq":           "init_margin_req",
+                "MaintMarginReq":          "maint_margin_req",
+                "Cushion":                 "cushion_pct",
+                "TotalCashValue":          "total_cash_value",
+                "StockMarketValue":        "stock_market_value",
+                "GrossPositionValue":      "gross_position_value",
+                "UnrealizedPnL":           "unrealized_pnl",
+                "RealizedPnL":             "realized_pnl",
+                "SMA":                     "sma",
+                "FullInitMarginReq":       "full_init_margin_req",
+                "FullMaintMarginReq":      "full_maint_margin_req",
+            }
+            if row.tag in tag_map:
+                result[tag_map[row.tag]] = val
+
+        return result
 
     # ── 异步调度 ──
 
@@ -214,13 +247,17 @@ class IBKRListener:
                 # processed=1：实时流已处理，阻止兜底清算引擎重复扣减
                 await fill_db.execute(
                     "INSERT OR IGNORE INTO tws_fills "
-                    "(exec_id, symbol, side, quantity, price, exec_time, "
-                    "order_id, order_ref, order_type, commission, exchange, processed) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    "(exec_id, perm_id, symbol, side, quantity, price, exec_time, "
+                    "order_id, order_ref, order_type, commission, exchange, "
+                    "liquidation, cum_qty, con_id, processed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
                     (
-                        execution.execId, symbol, side, qty, price, exec_time,
+                        execution.execId, execution.permId, symbol, side, qty, price, exec_time,
                         execution.orderId, setup_tag, order_type,
                         commission, fill_exchange,
+                        int(getattr(execution, "liquidation", 0) or 0),
+                        float(getattr(execution, "cumQty", 0) or 0),
+                        int(contract.conId),
                     ),
                 )
                 # 富化止损价：扫描 openTrades 匹配同 symbol 的 STP/STP LMT 订单
@@ -247,20 +284,34 @@ class IBKRListener:
                 async with connect_db() as conn:
                     conn.row_factory = aiosqlite.Row
                     cursor = await conn.execute(
-                        "SELECT id, side, quantity, entry_price, setup_tag "
+                        "SELECT id, side, quantity, entry_price, setup_tag, "
+                        "initial_stop, create_time "
                         "FROM shadow_ledger WHERE symbol=? AND status='OPEN'",
                         (symbol,),
                     )
-                    # 逐笔入队 Notion CLOSE 事件，杜绝斩立决后日记断档
+                    exit_time_ks = exec_time or datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    # 逐笔 CLOSE：含完整 journal 字段
                     async for row in cursor:
                         t_id = row["id"]
                         t_qty = float(row["quantity"])
                         t_entry = float(row["entry_price"])
                         t_side = row["side"]
+                        t_stop = float(row["initial_stop"] or 0)
+                        t_create = row["create_time"] or ""
                         actual_pnl = (
                             (price - t_entry) * t_qty
                             if t_side == "LONG"
                             else (t_entry - price) * t_qty
+                        )
+                        # 计算 R-multiple + holding_days（口径统一）
+                        exit_reason_ks, t_r, t_days = compute_close_journal(
+                            t_entry, t_stop, t_qty, actual_pnl, t_create, exit_time_ks,
+                        )
+                        await conn.execute(
+                            "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, "
+                            "exit_reason='KILL_SWITCH', r_multiple=?, holding_days=?, "
+                            "exit_time=?, commissions=? WHERE id=?",
+                            (price, t_r, t_days, exit_time_ks, commission, t_id),
                         )
                         await enqueue_outbound(
                             f"{t_id}-CLOSE", "notion",
@@ -272,12 +323,6 @@ class IBKRListener:
                                 "setup_tag": (row["setup_tag"] or "KILL_SWITCH"),
                             },
                         )
-                    await conn.execute(
-                        "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, "
-                        "exit_reason='KILL_SWITCH' "
-                        "WHERE symbol=? AND status='OPEN'",
-                        (price, symbol),
-                    )
                     await conn.commit()
             return
 
@@ -467,30 +512,23 @@ class IBKRListener:
                                 had_loss = True
                             elif actual_pnl > 0:
                                 had_profit = True
-                            # 计算 R-multiple 和持仓天数
-                            t_stop = float(row["current_stop"] or row["initial_stop"] or 0)
-                            t_risk = abs(t_entry - t_stop) * t_qty if t_stop > 0 else 0.0
-                            t_r = round(actual_pnl / t_risk, 2) if t_risk > 0 else 0.0
-                            create_t = row.get("create_time", "")
-                            t_days = 1
-                            if create_t:
-                                try:
-                                    from datetime import datetime as dt
-                                    d1 = dt.strptime(create_t[:10], "%Y-%m-%d")
-                                    d2 = dt.now()
-                                    t_days = max(1, (d2 - d1).days)
-                                except Exception:
-                                    pass
-                            exit_reason = "TARGET" if actual_pnl > 0 else "STOP_HIT"
-
+                            # 计算 R-multiple 和持仓天数（口径统一：R 以 initial_stop 为基准）
+                            t_stop = float(row["initial_stop"] or 0)
+                            create_t = row.get("create_time", "") or ""
                             exit_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                            exit_reason, t_r, t_days = compute_close_journal(
+                                t_entry, t_stop, t_qty, actual_pnl, create_t, exit_time,
+                            )
+                            t_risk = abs(t_entry - t_stop) * t_qty if t_stop > 0 else 0.0
                             await conn.execute(
                                 "UPDATE shadow_ledger SET status='CLOSED', "
                                 "exit_price=?, realized_pnl=?, "
                                 "exit_reason=?, r_multiple=?, holding_days=?, "
-                                "risk_amount=COALESCE(risk_amount, ?), exit_time=? "
+                                "risk_amount=COALESCE(risk_amount, ?), exit_time=?, "
+                                "commissions=? "
                                 "WHERE id=?",
-                                (price, actual_pnl, exit_reason, t_r, t_days, t_risk, exit_time, t_id),
+                                (price, actual_pnl, exit_reason, t_r, t_days, t_risk,
+                                 exit_time, commission, t_id),
                             )
                             pnl_sign = "+" if actual_pnl > 0 else ""
                             close_msg = (
@@ -579,11 +617,13 @@ class IBKRListener:
                         cursor = await conn.execute(
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, "
-                            "initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                            "initial_stop, current_stop, status, setup_tag, "
+                            "exec_time, order_type, order_tif, exchange, commissions) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, ?, ?, ?, ?, ?)",
                             (symbol, f"T{tranche_num}", new_side,
                              remaining_exit_qty, price,
-                             "Breakout" if new_side == "LONG" else "DS"),
+                             "Breakout" if new_side == "LONG" else "DS",
+                             exec_time, order_type, order_tif, fill_exchange, commission),
                         )
                         new_trade_id = cursor.lastrowid
                         await enqueue_outbound(
@@ -824,6 +864,90 @@ class IBKRListener:
 
 
 # ── 连亏追踪工具函数 ──
+
+    async def sync_open_orders(self) -> dict:
+        """Instance wrapper for the standalone sync function."""
+        return await _sync_open_orders_impl(self.ib)
+
+
+async def _sync_open_orders_impl(ib) -> dict:
+    """全局订单快照：reqAllOpenOrders + 止损同步 + 部分成交自动关仓。"""
+    if not ib or not ib.isConnected():
+        return {"synced": 0, "partial_fills": 0}
+
+    try:
+        orders = await ib.reqAllOpenOrdersAsync()
+    except Exception as e:
+        logger.error(f"全局订单快照失败: {e}")
+        return {"synced": 0, "partial_fills": 0}
+
+    if not orders:
+        return {"synced": 0, "partial_fills": 0}
+
+    synced = 0
+    partial_fills = 0
+
+    async with connect_db() as db:
+        db.row_factory = aiosqlite.Row
+        for ot in orders:
+            o = ot.order
+            s = ot.orderStatus
+            c = ot.contract
+
+            # 查上次快照的 filled_qty，用于增量检测
+            prev = await db.execute(
+                "SELECT filled_qty FROM open_orders_snapshot WHERE perm_id=?",
+                (o.permId,),
+            )
+            prev_row = await prev.fetchone()
+            prev_filled = float(prev_row["filled_qty"]) if prev_row else 0.0
+
+            await db.execute(
+                "INSERT OR REPLACE INTO open_orders_snapshot "
+                "(perm_id, symbol, order_type, action, aux_price, "
+                "total_qty, filled_qty, remaining_qty, avg_fill_price, "
+                "trail_stop_price, tif, oca_group, order_ref, "
+                "client_id, why_held, status, con_id, account, snapped_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "CURRENT_TIMESTAMP)",
+                (
+                    o.permId, c.symbol, o.orderType, o.action,
+                    float(o.auxPrice or 0), float(o.totalQuantity),
+                    float(s.filled), float(s.remaining),
+                    float(s.avgFillPrice or 0), float(o.trailStopPrice or 0),
+                    o.tif or "", str(o.ocaGroup or ""), o.orderRef or "",
+                    s.clientId or 0, s.whyHeld or "", s.status,
+                    int(c.conId), o.account or "",
+                ),
+            )
+            synced += 1
+
+            # 止损同步
+            if o.orderType in ("STP", "STP LMT") and float(o.auxPrice or 0) > 0:
+                await db.execute(
+                    "UPDATE shadow_ledger SET current_stop=? "
+                    "WHERE symbol=? AND status='OPEN'",
+                    (float(o.auxPrice), c.symbol),
+                )
+
+            # 部分成交检测（仅告警，不自动关仓 — 需 reconciliation 协调）
+            filled_qty = float(s.filled)
+            fill_increment = filled_qty - prev_filled
+            if fill_increment > 0 and float(s.remaining) > 0:
+                partial_fills += 1
+                avg_px = float(s.avgFillPrice or 0) or float(o.auxPrice or 0)
+                if avg_px > 0:
+                    logger.warning(
+                        f"部分成交告警 {c.symbol} "
+                        f"+{fill_increment:.0f}股 @ ${avg_px:.2f} "
+                        f"(订单 perm={o.permId}, 累计成交={filled_qty:.0f})"
+                    )
+
+    if synced > 0:
+        logger.info(f"订单快照 同步 {synced} 笔, 修复 {partial_fills} 笔部分成交")
+
+    return {"synced": synced, "partial_fills": partial_fills}
+
 
 async def _apply_consecutive_losses(conn, profitable: bool, losing: bool) -> None:
     """更新连亏计数器：盈利归零，亏损 +1。"""

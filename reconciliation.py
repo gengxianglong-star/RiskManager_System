@@ -4,10 +4,11 @@
 """
 
 import asyncio
+import datetime
 
 import aiosqlite
 
-from database import connect_db, count_open_tranches
+from database import connect_db, count_open_tranches, compute_close_journal
 from logger import logger
 from ai_logger import ai_trace
 from outbound_queue import enqueue_outbound
@@ -50,7 +51,8 @@ async def _close_ledger_discrepancy(
 
     remaining = abs(discrepancy)
     cursor = await conn.execute(
-        "SELECT id, quantity, entry_price, realized_pnl FROM shadow_ledger "
+        "SELECT id, quantity, entry_price, realized_pnl, initial_stop, "
+        "create_time FROM shadow_ledger "
         "WHERE symbol=? AND status='OPEN' AND side=? ORDER BY create_time ASC",
         (symbol, side_to_close),
     )
@@ -61,17 +63,24 @@ async def _close_ledger_discrepancy(
         t_qty = float(tranche["quantity"])
         t_entry = float(tranche["entry_price"])
         old_pnl = float(tranche["realized_pnl"] or 0)
+        t_stop = float(tranche["initial_stop"] or 0)
+        t_create = tranche["create_time"] or ""
 
         if t_qty <= remaining + 1e-6:
             # ── 尝试从 tws_fills 找成交价算 P&L ──
             exit_px, pnl, exit_time = _best_effort_pnl(
                 fills, t_entry, side_to_close, t_qty
             )
+            exit_reason, t_r, t_days = compute_close_journal(
+                t_entry, t_stop, t_qty, pnl, t_create, exit_time or now_iso,
+            )
             await conn.execute(
                 "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, "
                 "realized_pnl=COALESCE(realized_pnl,0)+?, "
-                "exit_reason='RECONCILE_CLOSE', exit_time=? WHERE id=?",
-                (exit_px, pnl, exit_time or now_iso, t_id),
+                "exit_reason=?, r_multiple=?, holding_days=?, exit_time=? "
+                "WHERE id=?",
+                (exit_px, pnl, exit_reason, t_r, t_days,
+                 exit_time or now_iso, t_id),
             )
             remaining -= t_qty
         else:
@@ -119,6 +128,18 @@ async def reconcile_physical_positions(ib, notify_func=None):
     if not ib.isConnected():
         logger.warning("TWS 未连接，跳过物理对账。")
         return
+
+    # ── 全局订单快照：止损同步 + 部分成交自愈修复 ──
+    try:
+        from ib_listener import _sync_open_orders_impl
+        result = await _sync_open_orders_impl(ib)
+        if result["synced"] > 0 or result["partial_fills"] > 0:
+            logger.info(
+                f"订单快照: {result['synced']} 笔活跃, "
+                f"{result['partial_fills']} 笔部分成交修复"
+            )
+    except Exception as e:
+        logger.warning(f"订单快照失败 (非致命): {e}")
 
     try:
         positions = await asyncio.wait_for(ib.reqPositionsAsync(), timeout=15)

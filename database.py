@@ -96,12 +96,46 @@ async def ensure_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS account_state (
                 date DATE PRIMARY KEY,
-                locked_equity REAL NOT NULL,
-                high_water_mark REAL NOT NULL,
-                risk_light TEXT NOT NULL
+                locked_equity        REAL NOT NULL,
+                high_water_mark      REAL NOT NULL,
+                risk_light           TEXT NOT NULL,
+                excess_liquidity     REAL DEFAULT 0,
+                buying_power         REAL DEFAULT 0,
+                init_margin_req      REAL DEFAULT 0,
+                maint_margin_req     REAL DEFAULT 0,
+                cushion_pct          REAL DEFAULT 0,
+                total_cash_value     REAL DEFAULT 0,
+                stock_market_value   REAL DEFAULT 0,
+                gross_position_value REAL DEFAULT 0,
+                unrealized_pnl       REAL DEFAULT 0,
+                realized_pnl         REAL DEFAULT 0,
+                sma                  REAL DEFAULT 0,
+                leverage             REAL DEFAULT 0,
+                drawdown_pct         REAL DEFAULT 0
             )
             """
         )
+        # ── 迁移：旧表补 account_state 扩展列 ──
+        _acct_cols = [
+            "excess_liquidity REAL DEFAULT 0",
+            "buying_power REAL DEFAULT 0",
+            "init_margin_req REAL DEFAULT 0",
+            "maint_margin_req REAL DEFAULT 0",
+            "cushion_pct REAL DEFAULT 0",
+            "total_cash_value REAL DEFAULT 0",
+            "stock_market_value REAL DEFAULT 0",
+            "gross_position_value REAL DEFAULT 0",
+            "unrealized_pnl REAL DEFAULT 0",
+            "realized_pnl REAL DEFAULT 0",
+            "sma REAL DEFAULT 0",
+            "leverage REAL DEFAULT 0",
+            "drawdown_pct REAL DEFAULT 0",
+        ]
+        for col_def in _acct_cols:
+            try:
+                await db.execute(f"ALTER TABLE account_state ADD COLUMN {col_def}")
+            except Exception:
+                pass
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_intents (
@@ -213,6 +247,7 @@ async def ensure_schema() -> None:
             """
             CREATE TABLE IF NOT EXISTS tws_fills (
                 exec_id       TEXT PRIMARY KEY,
+                perm_id       INTEGER NOT NULL,
                 symbol        TEXT NOT NULL,
                 sec_type      TEXT DEFAULT 'STK',
                 side          TEXT NOT NULL,
@@ -226,11 +261,35 @@ async def ensure_schema() -> None:
                 commission    REAL DEFAULT 0.0,
                 exchange      TEXT DEFAULT '',
                 account       TEXT DEFAULT '',
+                liquidation   INTEGER DEFAULT 0,
+                cum_qty       REAL DEFAULT 0,
+                con_id        INTEGER DEFAULT 0,
                 processed     INTEGER DEFAULT 0,
                 created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
                 processed_at  DATETIME
             )
             """
+        )
+        # ── 迁移：旧表补 perm_id 列 ──
+        try:
+            await db.execute(
+                "ALTER TABLE tws_fills ADD COLUMN perm_id INTEGER NOT NULL DEFAULT 0"
+            )
+        except Exception:
+            pass
+        # ── 迁移：补 liquidation / cum_qty / con_id ──
+        for col_def in (
+            "liquidation INTEGER DEFAULT 0",
+            "cum_qty REAL DEFAULT 0",
+            "con_id INTEGER DEFAULT 0",
+        ):
+            try:
+                await db.execute(f"ALTER TABLE tws_fills ADD COLUMN {col_def}")
+            except Exception:
+                pass
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_perm_processed "
+            "ON tws_fills(perm_id, processed)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_fills_symbol ON tws_fills(symbol)"
@@ -240,6 +299,38 @@ async def ensure_schema() -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_fills_processed ON tws_fills(processed)"
+        )
+
+        # ═══════════════════════════════════════════════════════════
+        # 全局订单快照：reqAllOpenOrders 全量字段持久化
+        # ═══════════════════════════════════════════════════════════
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS open_orders_snapshot (
+                perm_id          INTEGER PRIMARY KEY,
+                symbol           TEXT NOT NULL,
+                order_type       TEXT NOT NULL,
+                action           TEXT NOT NULL,
+                aux_price        REAL NOT NULL,
+                total_qty        REAL NOT NULL,
+                filled_qty       REAL DEFAULT 0,
+                remaining_qty    REAL DEFAULT 0,
+                avg_fill_price   REAL DEFAULT 0,
+                trail_stop_price REAL DEFAULT 0,
+                tif              TEXT DEFAULT '',
+                oca_group        TEXT DEFAULT '',
+                order_ref        TEXT DEFAULT '',
+                client_id        INTEGER DEFAULT 0,
+                why_held         TEXT DEFAULT '',
+                status           TEXT DEFAULT '',
+                con_id           INTEGER DEFAULT 0,
+                account          TEXT DEFAULT '',
+                snapped_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_symbol ON open_orders_snapshot(symbol)"
         )
 
         # ═══════════════════════════════════════════════════════════
@@ -316,27 +407,55 @@ async def ensure_schema() -> None:
         await db.commit()
 
 
-async def upsert_account_state(db_connection, equity: float, risk_light: str) -> None:
+async def upsert_account_state(
+    db_connection,
+    equity: float,
+    risk_light: str,
+    excess_liquidity: float = 0,
+    buying_power: float = 0,
+    init_margin_req: float = 0,
+    maint_margin_req: float = 0,
+    cushion_pct: float = 0,
+    total_cash_value: float = 0,
+    stock_market_value: float = 0,
+    gross_position_value: float = 0,
+    unrealized_pnl: float = 0,
+    realized_pnl: float = 0,
+    sma: float = 0,
+) -> None:
     today = trading_today_iso()
+    leverage = round(gross_position_value / equity, 2) if equity > 0 else 0.0
+
     cursor = await db_connection.execute(
         "SELECT high_water_mark FROM account_state WHERE date=?", (today,)
     )
     row = await cursor.fetchone()
     if row:
         hwm = max(float(row["high_water_mark"]), equity)
-        await db_connection.execute(
-            "UPDATE account_state SET locked_equity=?, high_water_mark=?, risk_light=? WHERE date=?",
-            (equity, hwm, risk_light, today),
-        )
     else:
         cursor = await db_connection.execute("SELECT MAX(high_water_mark) FROM account_state")
         prev = await cursor.fetchone()
         prev_hwm = float(prev[0]) if prev and prev[0] else equity
         hwm = max(prev_hwm, equity)
-        await db_connection.execute(
-            "INSERT INTO account_state (date, locked_equity, high_water_mark, risk_light) VALUES (?, ?, ?, ?)",
-            (today, equity, hwm, risk_light),
-        )
+
+    drawdown_pct = round((1 - equity / hwm) if hwm > 0 else 0.0, 4)
+
+    await db_connection.execute(
+        "INSERT OR REPLACE INTO account_state "
+        "(date, locked_equity, high_water_mark, risk_light, "
+        "excess_liquidity, buying_power, init_margin_req, maint_margin_req, "
+        "cushion_pct, total_cash_value, stock_market_value, "
+        "gross_position_value, unrealized_pnl, realized_pnl, "
+        "sma, leverage, drawdown_pct) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            today, equity, hwm, risk_light,
+            excess_liquidity, buying_power, init_margin_req, maint_margin_req,
+            cushion_pct, total_cash_value, stock_market_value,
+            gross_position_value, unrealized_pnl, realized_pnl,
+            sma, leverage, drawdown_pct,
+        ),
+    )
     await db_connection.commit()
 
 
@@ -401,3 +520,53 @@ async def get_today_trade_count(conn) -> int:
     )
     row = await cur.fetchone()
     return int(row[0]) if row else 0
+
+
+# ════════════════════════════════════════════════════════════════
+# Journal 辅助函数：消除跨文件重复的 r_multiple / holding_days 计算
+# ════════════════════════════════════════════════════════════════
+
+
+def extract_tws_fill_fields(fill_row: dict) -> dict:
+    """从 tws_fills 行提取 journal 列值，供 INSERT 路径复用。
+
+    fill_row 是 sqlite3.Row 或普通 dict，包含 tws_fills 表的所有列。
+    """
+    return {
+        "exec_time": fill_row.get("exec_time", "") or "",
+        "order_type": fill_row.get("order_type", "") or "",
+        "exchange": fill_row.get("exchange", "") or "",
+        "commissions": float(fill_row.get("commission") or 0),
+    }
+
+
+def compute_close_journal(
+    entry_price: float,
+    initial_stop: float,
+    close_qty: float,
+    pnl: float,
+    create_time: str,
+    exit_time: str,
+):
+    """计算平仓 journal 字段：(exit_reason, r_multiple, holding_days)。
+
+    r_multiple = pnl / (|entry - stop| * close_qty)，当 stop > 0 时有效。
+    holding_days = max(1, exit_time - create_time 的日历天数)。
+    exit_reason = "TARGET" 当 pnl > 0，否则 "STOP_HIT"。
+    """
+    risk_amount = (
+        abs(entry_price - initial_stop) * close_qty if initial_stop > 0 else 0.0
+    )
+    r_mult = round(pnl / risk_amount, 2) if risk_amount > 0 else 0.0
+    exit_reason = "TARGET" if pnl > 0 else "STOP_HIT"
+
+    days = 1
+    if create_time and exit_time:
+        try:
+            d1 = datetime.datetime.strptime(str(create_time)[:10], "%Y-%m-%d")
+            d2 = datetime.datetime.strptime(str(exit_time)[:10], "%Y-%m-%d")
+            days = max(1, (d2 - d1).days)
+        except Exception:
+            pass
+
+    return exit_reason, r_mult, days

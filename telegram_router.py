@@ -267,17 +267,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("📥 [指令触达] 收到 /status")
     try:
         try:
-            equity = await asyncio.wait_for(
-                app_context.ib_listener.fetch_account_equity(), timeout=8
+            acct = await asyncio.wait_for(
+                app_context.ib_listener.fetch_account_summary(), timeout=8
             )
         except Exception as e:
-            logger.warning(f"/status 净值读取降级: {e}")
-            equity = 0.0
+            logger.warning(f"/status 账户快照降级: {e}")
+            acct = {}
+        equity = acct.get("net_liquidation", 0.0)
 
         async with connect_db() as conn:
             conn.row_factory = aiosqlite.Row
             risk_light, risk_budget = await app_context.risk_engine.calculate_risk_light(conn, equity)
-            await upsert_account_state(conn, equity, risk_light)
+            await upsert_account_state(
+                conn, equity, risk_light,
+                excess_liquidity=acct.get("excess_liquidity", 0),
+                buying_power=acct.get("buying_power", 0),
+                init_margin_req=acct.get("init_margin_req", 0),
+                maint_margin_req=acct.get("maint_margin_req", 0),
+                cushion_pct=acct.get("cushion_pct", 0),
+                total_cash_value=acct.get("total_cash_value", 0),
+                stock_market_value=acct.get("stock_market_value", 0),
+                gross_position_value=acct.get("gross_position_value", 0),
+                unrealized_pnl=acct.get("unrealized_pnl", 0),
+                realized_pnl=acct.get("realized_pnl", 0),
+                sma=acct.get("sma", 0),
+            )
             cur = await conn.execute(
                 "SELECT symbol, tranche_id, side, quantity, entry_price, current_stop, initial_stop, setup_tag "
                 "FROM shadow_ledger WHERE status='OPEN' ORDER BY symbol, create_time"
@@ -285,6 +299,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = await cur.fetchall()
 
             current_total_risk = 0.0
+            naked_positions = 0
             for r in rows:
                 entry = float(r["entry_price"])
                 stop = float(r["current_stop"])
@@ -292,7 +307,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if stop > 0:
                     current_total_risk += abs(entry - stop) * qty
                 else:
-                    current_total_risk += entry * qty
+                    # 无止损仓位：用 MAX_STOP_PCT 估算风险（3%），而非整笔市值
+                    # 与其他风控路径（risk_engine / compute_close_journal）口径一致
+                    current_total_risk += entry * qty * MAX_STOP_PCT
+                    naked_positions += 1
 
             total_risk_pct = (current_total_risk / equity) * 100 if equity > 0 else 0.0
             risk_budget_pct = (risk_budget / equity) * 100 if equity > 0 else 0.0
@@ -305,11 +323,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif "红灯" in risk_light:
                 light_desc = "(严重回撤，已禁止新开仓)"
 
+            risk_note = ""
+            if naked_positions > 0:
+                risk_note = (
+                    f" (含 {naked_positions} 笔裸奔仓位的 {MAX_STOP_PCT*100:.0f}% 估算风险)"
+                )
             lines = await app_context.gateway.build_service_status_lines() + [
                 f"💰 净值: ${equity:,.2f}",
                 f"🚦 风控灯: {risk_light} {light_desc}",
                 f"📐 单笔额度: ${risk_budget:,.2f} ({risk_budget_pct:.2f}%)",
-                f"🔥 总敞口风险: ${current_total_risk:,.2f} ({total_risk_pct:.2f}%)",
+                f"🔥 总敞口风险: ${current_total_risk:,.2f} ({total_risk_pct:.2f}%){risk_note}",
                 "",
             ]
             if not rows:
@@ -330,10 +353,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         warn = " ⚠️ [止损方向异常: 疑似止盈单]"
                     else:
                         warn = ""
+                    # 单笔风险（口径统一：有止损=实际距离×股数，裸奔=3%估算）
+                    if stop > 0:
+                        pos_risk = abs(entry - stop) * float(r['quantity'])
+                    else:
+                        pos_risk = entry * float(r['quantity']) * MAX_STOP_PCT
                     lines.append(
                         f"  • {side} {r['symbol']} {r['tranche_id']} "
                         f"{r['quantity']:.0f}股 @ {entry:.2f} "
-                        f"stop {stop:.2f} [{r['setup_tag'] or ' '}]{warn}"
+                        f"stop {stop:.2f} [risk ${pos_risk:.0f}]"
+                        f"[{r['setup_tag'] or ' '}]{warn}"
                     )
 
             chunk: list[str] = []
@@ -398,11 +427,13 @@ async def cmd_import(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await cur.fetchone():
                 continue
             tranche_id = f"T{await count_open_tranches(conn, sym) + 1}"
+            exec_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
             await conn.execute(
                 "INSERT INTO shadow_ledger "
-                "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
-                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'TWS_SYNC')",
-                (sym, tranche_id, side, qty, entry),
+                "(symbol, tranche_id, side, quantity, entry_price, initial_stop, "
+                "current_stop, status, setup_tag, exec_time) "
+                "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'TWS_SYNC', ?)",
+                (sym, tranche_id, side, qty, entry, exec_now),
             )
             imported.append(f"{side} {sym} {qty:.0f}股 @ {entry:.2f}")
         await conn.commit()

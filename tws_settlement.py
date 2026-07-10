@@ -16,7 +16,7 @@ from ib_insync import ExecutionFilter
 from ib_insync.util import formatIBDatetime
 
 from ai_logger import ai_trace, logger
-from database import connect_db
+from database import connect_db, compute_close_journal, extract_tws_fill_fields
 from outbound_queue import enqueue_outbound
 
 
@@ -85,13 +85,17 @@ class TWSSettlement:
                 # processed=0：交由 Phase 1 批处理核销
                 cursor = await db.execute(
                     "INSERT OR IGNORE INTO tws_fills "
-                    "(exec_id, symbol, side, quantity, price, exec_time, "
-                    "order_id, commission, exchange, processed) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    "(exec_id, perm_id, symbol, side, quantity, price, exec_time, "
+                    "order_id, commission, exchange, "
+                    "liquidation, cum_qty, con_id, processed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (
-                        execution.execId, symbol, side, qty, price, exec_time,
+                        execution.execId, execution.permId, symbol, side, qty, price, exec_time,
                         execution.orderId, commission_val,
                         getattr(execution, "exchange", "") or "",
+                        int(getattr(execution, "liquidation", 0) or 0),
+                        float(getattr(execution, "cumQty", 0) or 0),
+                        int(contract.conId),
                     ),
                 )
                 if cursor.rowcount > 0:
@@ -146,29 +150,62 @@ class TWSSettlement:
                 zip([c[0] for c in cursor.description], row)
             )
 
+            # ── ORDER-LEVEL AGGREGATION: GROUP BY perm_id 还原拆单碎片为原始订单 ──
+            # VWAP = SUM(price * quantity) / SUM(quantity)，财务盈亏分毫不差
             cursor = await db.execute(
-                "SELECT * FROM tws_fills WHERE processed=0 ORDER BY exec_time ASC"
+                "SELECT "
+                "  perm_id, "
+                "  MAX(exec_id)   AS last_exec_id, "
+                "  symbol, "
+                "  side, "
+                "  SUM(quantity)  AS agg_qty, "
+                "  SUM(price * quantity) / SUM(quantity) AS agg_price, "
+                "  MAX(exec_time) AS last_time, "
+                "  MAX(order_ref) AS order_ref, "
+                "  MAX(order_type) AS order_type, "
+                "  MAX(aux_price) AS aux_price, "
+                "  MAX(exchange)  AS exchange, "
+                "  MAX(commission) AS commission "
+                "FROM tws_fills "
+                "WHERE processed=0 "
+                "GROUP BY perm_id, symbol, side "
+                "ORDER BY last_time ASC"
             )
             unprocessed = await cursor.fetchall()
 
             if not unprocessed:
                 return 0, 0.0
 
-            logger.info(f"⚙️ [Phase 1] 发现 {len(unprocessed)} 笔离线未清算记录，开始 FIFO 匹配...")
+            # 碎片数 = 实际 exec 数 vs 聚合后的订单数
+            cursor2 = await db.execute(
+                "SELECT COUNT(*) FROM tws_fills WHERE processed=0"
+            )
+            raw_count = (await cursor2.fetchone())[0]
+            logger.info(
+                f"⚙️ [Phase 1] {raw_count} 笔碎片 → {len(unprocessed)} 笔订单 (perm_id 聚合)，"
+                f"开始 FIFO 匹配..."
+            )
 
-            for fill in unprocessed:
-                exec_id = fill["exec_id"]
-                symbol = fill["symbol"]
-                f_side = fill["side"]
-                f_qty = float(fill["quantity"])
-                f_price = float(fill["price"])
-                order_ref = fill["order_ref"] or (
+            for order in unprocessed:
+                perm_id = order["perm_id"]
+                exec_id = order["last_exec_id"]
+                symbol = order["symbol"]
+                f_side = order["side"]
+                f_qty = float(order["agg_qty"])        # 聚合总股数
+                f_price = float(order["agg_price"])     # VWAP 加权均价
+                order_ref = order["order_ref"] or (
     "Breakout" if f_side == "LONG" else "DS"
 )
+                jf = {
+                    "exec_time": order["last_time"] or "",
+                    "order_type": order["order_type"] or "",
+                    "exchange": order["exchange"] or "",
+                    "commissions": float(order["commission"] or 0),
+                }
 
                 cur_open = await db.execute(
                     "SELECT id, side, quantity, entry_price, initial_stop, "
-                    "current_stop, realized_pnl, setup_tag "
+                    "current_stop, realized_pnl, setup_tag, create_time "
                     "FROM shadow_ledger WHERE symbol=? AND status='OPEN' "
                     "ORDER BY create_time ASC",
                     (symbol,),
@@ -181,20 +218,23 @@ class TWSSettlement:
                     cur_ins = await db.execute(
                         "INSERT INTO shadow_ledger "
                         "(symbol, tranche_id, side, quantity, entry_price, "
-                        "initial_stop, current_stop, status, setup_tag) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?)",
+                        "initial_stop, current_stop, status, setup_tag, "
+                        "exec_time, order_type, exchange, commissions) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)",
                         (
                             symbol, tranche_id, f_side, f_qty, f_price,
                             float(fill["aux_price"] or 0),
                             float(fill["aux_price"] or 0),
                             order_ref,
+                            jf["exec_time"], jf["order_type"],
+                            jf["exchange"], jf["commissions"],
                         ),
                     )
                     new_tid = cur_ins.lastrowid
                     await db.execute(
                         "UPDATE tws_fills SET processed=1, processed_at=CURRENT_TIMESTAMP "
-                        "WHERE exec_id=?",
-                        (exec_id,),
+                        "WHERE perm_id=?",
+                        (perm_id,),
                     )
                     await db.commit()  # 释放写锁，允许 enqueue_outbound 写入
                     await enqueue_outbound(
@@ -225,6 +265,8 @@ class TWSSettlement:
                         t_entry = float(row["entry_price"])
                         t_side = row["side"]
                         old_pnl = float(row["realized_pnl"] or 0.0)
+                        t_stop = float(row["initial_stop"] or 0)
+                        t_create = row.get("create_time", "") or ""
 
                         close_qty = min(t_qty, remaining_qty)
                         if t_side == "LONG":
@@ -246,12 +288,19 @@ class TWSSettlement:
                             fill.get("exec_time", "") if isinstance(fill, dict)
                             else getattr(fill, "exec_time", "")
                         ) or ""
+                        exit_reason, t_r, t_days = compute_close_journal(
+                            t_entry, t_stop, close_qty, portion_pnl, t_create, exit_time,
+                        )
                         await db.execute(
                             "UPDATE shadow_ledger SET status=?, exit_price=?, "
-                            "quantity=?, realized_pnl=?, exit_time=? WHERE id=?",
+                            "quantity=?, realized_pnl=?, exit_time=?, "
+                            "exit_reason=?, r_multiple=?, holding_days=?, commissions=? "
+                            "WHERE id=?",
                             (
                                 "CLOSED" if is_closed else "OPEN",
-                                f_price, new_qty, new_pnl, exit_time, t_id,
+                                f_price, new_qty, new_pnl, exit_time,
+                                exit_reason, t_r, t_days, jf["commissions"],
+                                t_id,
                             ),
                         )
 
@@ -281,11 +330,14 @@ class TWSSettlement:
                         cur_os = await db.execute(
                             "INSERT INTO shadow_ledger "
                             "(symbol, tranche_id, side, quantity, entry_price, "
-                            "initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?)",
+                            "initial_stop, current_stop, status, setup_tag, "
+                            "exec_time, order_type, exchange, commissions) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, ?, ?, ?, ?)",
                             (
                                 symbol, os_tid, f_side, remaining_qty,
                                 f_price, order_ref,
+                                jf["exec_time"], jf["order_type"],
+                                jf["exchange"], jf["commissions"],
                             ),
                         )
                         new_os_id = cur_os.lastrowid
@@ -306,8 +358,8 @@ class TWSSettlement:
 
                     await db.execute(
                         "UPDATE tws_fills SET processed=2, "
-                        "processed_at=CURRENT_TIMESTAMP WHERE exec_id=?",
-                        (exec_id,),
+                        "processed_at=CURRENT_TIMESTAMP WHERE perm_id=?",
+                        (perm_id,),
                     )
 
                     # ── 更新连亏计数器 ──
