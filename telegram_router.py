@@ -431,8 +431,9 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await app_context.sync_flex_query_job()
-    await update.message.reply_text("✅ 静默对账已触发，若有平仓将单独推送捷报。")
+    logger.info("收到手动强制原生结算指令。")
+    await app_context.sync_tws_settlement_job()
+    await update.message.reply_text("✅ TWS 原生结算对账已触发。")
 
 
 @require_auth

@@ -26,13 +26,31 @@ def _fmt_signed_position(qty: float) -> str:
 async def _close_ledger_discrepancy(
     conn: aiosqlite.Connection, symbol: str, discrepancy: float
 ) -> None:
-    """按 FIFO 削减账本仓位；discrepancy = 账本 signed - TWS signed。"""
+    """按 FIFO 削减账本仓位；discrepancy = 账本 signed - TWS signed。
+
+    优先从 tws_fills 查找对应成交价自算 P&L，找不到则标记为 RECONCILE_MISS。
+    """
     if abs(discrepancy) < 1e-6:
         return
+
+    import datetime
+
     side_to_close = "LONG" if discrepancy > 0 else "SHORT"
+    close_side = "SHORT" if side_to_close == "LONG" else "LONG"
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    # 查询 tws_fills 中该 symbol 的平仓方向成交（按时间降序，最近的优先）
+    fills_cursor = await conn.execute(
+        "SELECT quantity, price, exec_time, order_ref FROM tws_fills "
+        "WHERE symbol=? AND side=? AND processed > 0 "
+        "ORDER BY exec_time DESC",
+        (symbol, close_side),
+    )
+    fills = await fills_cursor.fetchall()
+
     remaining = abs(discrepancy)
     cursor = await conn.execute(
-        "SELECT id, quantity FROM shadow_ledger "
+        "SELECT id, quantity, entry_price, realized_pnl FROM shadow_ledger "
         "WHERE symbol=? AND status='OPEN' AND side=? ORDER BY create_time ASC",
         (symbol, side_to_close),
     )
@@ -41,10 +59,19 @@ async def _close_ledger_discrepancy(
             break
         t_id = tranche["id"]
         t_qty = float(tranche["quantity"])
+        t_entry = float(tranche["entry_price"])
+        old_pnl = float(tranche["realized_pnl"] or 0)
+
         if t_qty <= remaining + 1e-6:
+            # ── 尝试从 tws_fills 找成交价算 P&L ──
+            exit_px, pnl, exit_time = _best_effort_pnl(
+                fills, t_entry, side_to_close, t_qty
+            )
             await conn.execute(
-                "UPDATE shadow_ledger SET status='CLOSED', exit_price=0, realized_pnl=0 WHERE id=?",
-                (t_id,),
+                "UPDATE shadow_ledger SET status='CLOSED', exit_price=?, "
+                "realized_pnl=COALESCE(realized_pnl,0)+?, "
+                "exit_reason='RECONCILE_CLOSE', exit_time=? WHERE id=?",
+                (exit_px, pnl, exit_time or now_iso, t_id),
             )
             remaining -= t_qty
         else:
@@ -53,6 +80,29 @@ async def _close_ledger_discrepancy(
                 (t_qty - remaining, t_id),
             )
             remaining = 0
+
+
+def _best_effort_pnl(
+    fills: list, entry_price: float, pos_side: str, close_qty: float
+) -> tuple[float, float, str]:
+    """从 tws_fills 列表中查找最近的成交价，自算 P&L。
+
+    Returns: (exit_price, pnl, exit_time_iso)
+    """
+    if fills:
+        best = fills[0]
+        exit_px = float(best["price"]) if isinstance(best, dict) else float(best[1])
+        exit_time = (
+            best["exec_time"] if isinstance(best, dict) else best[2]
+        ) or ""
+        if pos_side == "LONG":
+            pnl = (exit_px - entry_price) * close_qty
+        else:
+            pnl = (entry_price - exit_px) * close_qty
+        return exit_px, pnl, exit_time
+
+    # 找不到任何 fill → 保留 entry_price 为参考，P&L=0，标记为 MISS
+    return entry_price, 0.0, ""
 
 
 @ai_trace
@@ -134,12 +184,14 @@ async def reconcile_physical_positions(ib, notify_func=None):
                         auto_entry = float(pos.avgCost)
                         if auto_entry <= 0:
                             continue
+                        auto_tag = "Breakout" if auto_side == "LONG" else "DS"
+                        auto_exec_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         tranche_id = f"T{await count_open_tranches(conn, sym) + 1}"
                         cursor = await conn.execute(
                             "INSERT INTO shadow_ledger "
-                            "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag) "
-                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', 'TWS_SYNC')",
-                            (sym, tranche_id, auto_side, auto_qty, auto_entry),
+                            "(symbol, tranche_id, side, quantity, entry_price, initial_stop, current_stop, status, setup_tag, exec_time) "
+                            "VALUES (?, ?, ?, ?, ?, 0.0, 0.0, 'OPEN', ?, ?)",
+                            (sym, tranche_id, auto_side, auto_qty, auto_entry, auto_tag, auto_exec_time),
                         )
                         new_trade_id = cursor.lastrowid
                         await conn.commit()  # 释放写锁后再调用出站队列，防止 database is locked
@@ -162,7 +214,7 @@ async def reconcile_physical_positions(ib, notify_func=None):
                                 "entry_price": auto_entry,
                                 "initial_stop": 0.0,
                                 "current_stop": 0.0,
-                                "setup_tag": "TWS_SYNC",
+                                "setup_tag": auto_tag,
                                 "create_time": "",
                                 "spy_context": "",
                             },

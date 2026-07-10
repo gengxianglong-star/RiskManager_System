@@ -51,7 +51,10 @@ async def async_test_db():
         async with _connect_db() as _cleanup_conn:
             for _tbl in ("shadow_ledger", "outbound_queue", "account_state",
                          "pending_intents", "auth_tokens",
-                         "daily_reviews", "applied_splits", "flex_processed_execs"):
+                         "daily_reviews", "applied_splits",
+                         "flex_processed_execs", "tws_fills", "fill_processed",
+                         "notion_queue", "trade_tags", "trade_reviews",
+                         "market_snapshots", "stop_adjustments"):
                 try:
                     await _cleanup_conn.execute(f"DELETE FROM {_tbl}")
                 except Exception:

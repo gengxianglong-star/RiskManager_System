@@ -108,6 +108,7 @@ from database import (
     upsert_account_state,
     get_today_trade_count,
 )
+from ai_logger import ai_trace
 from logger import logger
 from market_regime import REGIME_OFFLINE_LABEL, fetch_market_regime
 from notion_api import check_notion_online, enqueue_notion, push_to_notion
@@ -115,7 +116,8 @@ from outbound_queue import enqueue_outbound, outbound_worker
 from reconciliation import reconcile_physical_positions
 from risk_engine import RiskEngine, eod_10ema_sniper_job, set_app_context
 from telegram_router import register_handlers, sync_bot_commands
-from flex_settlement import run_flex_settlement
+from tws_settlement import run_tws_settlement
+# flex_settlement.run_flex_settlement 保留作为回退（未被调用）
 from ib_listener import IBKRListener
 from gateway import TelegramGateway
 from scale_out_monitor import ScaleOutMonitor
@@ -223,14 +225,14 @@ class RiskManagerApp:
             replace_existing=True,
         )
 
-        # 每日 09:00 和 16:30 (美东) 执行 Flex 权威结算
+        # 每日 09:00 和 16:30 (美东) 执行 TWS 原生结算（替代 Flex Query）
         self.scheduler.add_job(
-            run_flex_settlement,
+            self.sync_tws_settlement_job,
             'cron',
             hour='9,16', minute='0,30',
-            args=[self.gateway.notify_user, self.ib],
-            id="flex_settlement_job",
+            id="tws_settlement_job",
             replace_existing=True,
+            misfire_grace_time=300,
         )
 
         # 每日 00:05 (美东) 执行跨日自检
@@ -273,13 +275,14 @@ class RiskManagerApp:
         self.scheduler.start()
         logger.info("✅ APScheduler 已启动，所有 Cron Job 注册完毕。")
 
-    async def sync_flex_query_job(self):
-        """Flex 权威结算的薄封装（兼容旧调用点）。
+    @ai_trace
+    async def sync_tws_settlement_job(self) -> None:
+        """TWS 原生结算 — 替代 Flex Query。
 
-        APScheduler 每天 09:00/16:30 自动调度 run_flex_settlement；
-        此方法供 /sync 命令和 TWS 重连时手动触发。
+        APScheduler 每天 09:00/16:30 自动调度；/sync 命令和 TWS 重连时手动触发。
         """
-        await run_flex_settlement(self.gateway.notify_user, self.ib)
+        logger.info("🕒 触发定时 TWS 原生结算/对账任务...")
+        await run_tws_settlement(self.gateway.notify_user, self.ib)
 
     async def _heartbeat_2300_check(self):
         """23:00 强制坦白检查（由 APScheduler 每天触发，替代原 heartbeat_2300_daemon）。"""
@@ -613,8 +616,8 @@ def calc_share_quantity(risk_budget: float, entry_price: float, stop_price: floa
 
 
 async def sync_flex_query(context=None):
-    """兼容旧调用：手动触发 Flex 结算。"""
-    await app.sync_flex_query_job()
+    """兼容旧调用：手动触发 TWS 原生结算。"""
+    await app.sync_tws_settlement_job()
 
 
 
@@ -639,10 +642,10 @@ async def _pre_init_core() -> None:
     if tws_ok:
         logger.info("✅ TWS 已连接，主客户端(Master Client)全局跨端监听已启动。")
         await asyncio.sleep(1)
-        # 🚀 恢复开机自动拉取 Flex：MD5 哈希防重 + 1001 静默保护已就绪
-        # 即使频繁重启，也不会触发 IBKR 封禁。开机强拉可第一时间补齐离线期间的结算数据。
+        # 🚀 开机自检：触发 TWS 原生结算拉取（替代限流的 Flex）
+        logger.info("🔄 执行开机自检：触发 TWS 原生对账拉取...")
         await reconcile_physical_positions(app.ib, tg_gateway.notify_user)
-        app.spawn_background_task(run_flex_settlement(tg_gateway.notify_user, app.ib))
+        asyncio.create_task(run_tws_settlement(tg_gateway.notify_user, app.ib))
     else:
         logger.info("⚠️ TWS 未连接，/init 报价与成交同步将不可用。")
 

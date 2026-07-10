@@ -14,7 +14,7 @@ from telegram import Bot
 from telegram.error import NetworkError, RetryAfter, TimedOut
 
 from ai_logger import ai_trace, logger
-from config import DB_PATH, MY_TELEGRAM_CHAT_ID, resolve_tws_ports
+from config import MY_TELEGRAM_CHAT_ID, resolve_db_path, resolve_tws_ports
 from database import connect_db
 
 
@@ -182,8 +182,9 @@ class TelegramGateway:
 
         # 5. SQLite 体积
         try:
-            if os.path.exists(DB_PATH):
-                db_size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
+            _db_path = resolve_db_path()
+            if os.path.exists(_db_path):
+                db_size_mb = os.path.getsize(_db_path) / (1024 * 1024)
                 lines.append(f"🗄️ SQLite 体积: {db_size_mb:.2f} MB")
         except Exception:
             pass

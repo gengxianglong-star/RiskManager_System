@@ -4,7 +4,9 @@ from zoneinfo import ZoneInfo
 
 import aiosqlite
 
-from config import DB_PATH, DB_TIMEOUT, TRADING_TZ
+from config import DB_TIMEOUT, TRADING_TZ, resolve_db_path
+
+DB_PATH = resolve_db_path()
 
 
 @asynccontextmanager
@@ -76,6 +78,7 @@ async def ensure_schema() -> None:
             ("mae_pct", "REAL DEFAULT 0.0"),
             ("mfe_pct", "REAL DEFAULT 0.0"),
             ("journal_note", "TEXT DEFAULT ''"),
+            ("exit_time", "TEXT DEFAULT ''"),
         ]
         for col_name, col_def in _journal_cols:
             try:
@@ -202,6 +205,42 @@ async def ensure_schema() -> None:
             await db.execute("ALTER TABLE outbound_queue ADD COLUMN notion_page_id TEXT")
         except Exception:
             pass
+
+        # ═══════════════════════════════════════════════════════════
+        # TWS 原生结算引擎：原始成交持久化表
+        # ═══════════════════════════════════════════════════════════
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tws_fills (
+                exec_id       TEXT PRIMARY KEY,
+                symbol        TEXT NOT NULL,
+                sec_type      TEXT DEFAULT 'STK',
+                side          TEXT NOT NULL,
+                quantity      REAL NOT NULL,
+                price         REAL NOT NULL,
+                exec_time     TEXT NOT NULL,
+                order_id      INTEGER DEFAULT 0,
+                order_ref     TEXT DEFAULT '',
+                order_type    TEXT DEFAULT '',
+                aux_price     REAL DEFAULT 0.0,
+                commission    REAL DEFAULT 0.0,
+                exchange      TEXT DEFAULT '',
+                account       TEXT DEFAULT '',
+                processed     INTEGER DEFAULT 0,
+                created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
+                processed_at  DATETIME
+            )
+            """
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_symbol ON tws_fills(symbol)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_time ON tws_fills(exec_time)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fills_processed ON tws_fills(processed)"
+        )
 
         # ═══════════════════════════════════════════════════════════
         # 交易日志标准：4 张新表

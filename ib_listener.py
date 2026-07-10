@@ -104,7 +104,7 @@ class IBKRListener:
             await asyncio.sleep(15)
 
     async def _on_tws_reconnect(self):
-        """TWS 恢复连接后自动补齐：仓位对账 + Flex 交易记录。"""
+        """TWS 恢复连接后自动补齐：仓位对账 + TWS 原生结算。"""
         logger.info("🔄 TWS 重连：开始自动补齐...")
         await asyncio.sleep(2)
         try:
@@ -112,7 +112,7 @@ class IBKRListener:
             await reconcile_physical_positions(self.ib, self.gateway.notify_user)
         except Exception as e:
             logger.error(f"重连对账失败: {e}")
-        self.ctx.spawn_background_task(self.ctx.sync_flex_query_job())
+        self.ctx.spawn_background_task(self.ctx.sync_tws_settlement_job())
 
     # ── 行情拉取 ──
 
@@ -207,6 +207,37 @@ class IBKRListener:
             float(fill.commissionReport.commission)
             if fill.commissionReport and fill.commissionReport.commission else 0.0
         )
+
+        # ── TWS 原生结算：raw fills 实时持久化 + 订单上下文富化 ──
+        try:
+            async with connect_db() as fill_db:
+                # processed=1：实时流已处理，阻止兜底清算引擎重复扣减
+                await fill_db.execute(
+                    "INSERT OR IGNORE INTO tws_fills "
+                    "(exec_id, symbol, side, quantity, price, exec_time, "
+                    "order_id, order_ref, order_type, commission, exchange, processed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    (
+                        execution.execId, symbol, side, qty, price, exec_time,
+                        execution.orderId, setup_tag, order_type,
+                        commission, fill_exchange,
+                    ),
+                )
+                # 富化止损价：扫描 openTrades 匹配同 symbol 的 STP/STP LMT 订单
+                if self.ib.isConnected():
+                    for ot in self.ib.openTrades():
+                        if (
+                            ot.contract.symbol == symbol
+                            and ot.order.orderType in ("STP", "STP LMT")
+                        ):
+                            await fill_db.execute(
+                                "UPDATE tws_fills SET aux_price=? WHERE exec_id=?",
+                                (float(ot.order.auxPrice), execution.execId),
+                            )
+                            break
+                await fill_db.commit()
+        except Exception:
+            pass  # tws_fills 写入失败不应阻断主流程
 
         # ── Kill Switch 平仓 ──
         if setup_tag == "KILL_SWITCH":
@@ -452,13 +483,14 @@ class IBKRListener:
                                     pass
                             exit_reason = "TARGET" if actual_pnl > 0 else "STOP_HIT"
 
+                            exit_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
                             await conn.execute(
                                 "UPDATE shadow_ledger SET status='CLOSED', "
                                 "exit_price=?, realized_pnl=?, "
                                 "exit_reason=?, r_multiple=?, holding_days=?, "
-                                "risk_amount=COALESCE(risk_amount, ?) "
+                                "risk_amount=COALESCE(risk_amount, ?), exit_time=? "
                                 "WHERE id=?",
-                                (price, actual_pnl, exit_reason, t_r, t_days, t_risk, t_id),
+                                (price, actual_pnl, exit_reason, t_r, t_days, t_risk, exit_time, t_id),
                             )
                             pnl_sign = "+" if actual_pnl > 0 else ""
                             close_msg = (
@@ -594,6 +626,12 @@ class IBKRListener:
                 )
                 await dedup_db.execute(
                     "INSERT OR IGNORE INTO fill_processed (exec_id) VALUES (?)",
+                    (execution.execId,),
+                )
+                # 标记 tws_fills 已由实时处理器完成（避免结算引擎重复处理）
+                await dedup_db.execute(
+                    "UPDATE tws_fills SET processed=1, processed_at=CURRENT_TIMESTAMP "
+                    "WHERE exec_id=?",
                     (execution.execId,),
                 )
                 await dedup_db.commit()

@@ -21,6 +21,24 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN", "YOUR_NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "YOUR_NOTION_DATABASE_ID")
 DB_PATH = os.getenv("DB_PATH", "risk_manager.db")
 DB_TIMEOUT = float(os.getenv("DB_TIMEOUT", "10.0"))
+
+
+def resolve_db_path() -> str:
+    """根据桌面端账户模式返回独立数据库路径，防止模拟/实盘数据混淆。"""
+    if DB_PATH not in ("risk_manager.db", ""):
+        return DB_PATH  # 用户显式指定了路径，原样使用
+
+    mode = "paper"
+    if DESKTOP_SETTINGS_PATH.exists():
+        try:
+            import json
+            data = json.loads(DESKTOP_SETTINGS_PATH.read_text(encoding="utf-8"))
+            mode = str(data.get("account_mode", mode)).lower()
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    suffix = "live" if mode == "live" else "paper"
+    return f"risk_manager_{suffix}.db"
 # 狙击手协议与 account_state 日切时区（美股默认美东）
 TRADING_TZ = os.getenv("TRADING_TZ", "America/New_York")
 

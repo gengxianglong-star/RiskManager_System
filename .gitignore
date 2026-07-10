@@ -1,4 +1,8 @@
 risk_manager.db
+risk_manager_paper.db
+risk_manager_live.db
+risk_manager*.db-shm
+risk_manager*.db-wal
 risk_manager.log
 risk_manager_trace.log
 .env
@@ -6,3 +10,4 @@ __pycache__/
 *.pyc
 .venv/
 bot_output.log
+file::memory:?cache=shared
