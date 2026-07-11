@@ -140,6 +140,42 @@ def _flex_trade_attr(trade, *names, default=""):
     return default
 
 
+_REALIZED_PNL_FIELDS = (
+    "fifoPnlRealized", "realizedPNL", "RealizedPNL",
+    "realizedPL", "realizedPnl", "RealizedP/L",
+)
+_EXEC_ID_FIELDS = ("ibExecID", "ibExecutionID", "ibOrderID", "tradeID", "TradeID")
+
+
+def _flex_realized_pnl(trade) -> float:
+    try:
+        return float(_flex_trade_attr(trade, *_REALIZED_PNL_FIELDS, default=0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _flex_exec_id(trade) -> str:
+    return str(_flex_trade_attr(trade, *_EXEC_ID_FIELDS, default="") or "")
+
+
+def _flex_level_of_detail(trade) -> str:
+    return str(
+        _flex_trade_attr(trade, "levelOfDetail", "LevelOfDetail", default="") or ""
+    ).lower()
+
+
+def _flex_trade_sort_key(trade) -> tuple:
+    """Closed Lot 行优先于 Executions 行，避免零 PnL 执行行抢占 exec_id。"""
+    lod = _flex_level_of_detail(trade)
+    is_closed_lot = "closed" in lod
+    return (0 if is_closed_lot else 1, -abs(_flex_realized_pnl(trade)))
+
+
+def _prepare_flex_trades(report) -> list:
+    trades = report.extract("Trade") or []
+    return sorted(trades, key=_flex_trade_sort_key)
+
+
 @ai_trace
 async def _run_executions_fallback(ib, tg_notify_func) -> None:
     """Flex 降级路径：当 Flex 1001/1025 限流时，从 TWS 拉取成交记录。
@@ -465,7 +501,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
                 )
         return
 
-    trades = report.extract("Trade")
+    trades = _prepare_flex_trades(report)
     if not trades:
         logger.info("🧾 Flex 报表中无任何交易记录。")
         return
@@ -475,12 +511,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
         (
             _flex_trade_attr(t, "symbol", "underlyingSymbol"),
             float(_flex_trade_attr(t, "tradePrice", "TradePrice", default=0) or 0),
-            float(
-                _flex_trade_attr(
-                    t, "fifoPnlRealized", "realizedPL", "realizedPnl", "RealizedP/L",
-                    default=0,
-                ) or 0
-            ),
+            _flex_realized_pnl(t),
         )
         for t in trades
     ]
@@ -521,11 +552,11 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
             if not symbol:
                 continue
 
-            exec_id = _flex_trade_attr(trade, "ibExecID", "ibOrderID", "tradeID")
+            exec_id = _flex_exec_id(trade)
             if not exec_id:
                 exec_id = hashlib.md5(
-                    f"{symbol}-{getattr(trade, 'tradePrice', 0)}-"
-                    f"{getattr(trade, 'fifoPnlRealized', 0)}".encode()
+                    f"{symbol}-{_flex_trade_attr(trade, 'tradePrice', 'TradePrice', default=0)}-"
+                    f"{_flex_realized_pnl(trade)}".encode()
                 ).hexdigest()
 
             cur = await db.execute(
@@ -537,20 +568,11 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
             exec_price = float(
                 _flex_trade_attr(trade, "tradePrice", "TradePrice", default=0) or 0
             )
-            realized_pnl = float(
-                _flex_trade_attr(
-                    trade,
-                    "fifoPnlRealized", "realizedPL", "realizedPnl", "RealizedP/L",
-                    default=0,
-                ) or 0
-            )
+            realized_pnl = _flex_realized_pnl(trade)
 
-            # ── 未实现盈亏 → 跳过，留给阶段 2 处理 ──
+            # Executions 行 PnL=0：跳过且不入 flex_processed_execs，
+            # 否则同 exec_id 的 Closed Lot 行会被误挡（Executions+Closed Lots 双选场景）
             if abs(realized_pnl) < 1e-4:
-                await db.execute(
-                    "INSERT OR IGNORE INTO flex_processed_execs (exec_id) VALUES (?)",
-                    (exec_id,),
-                )
                 continue
 
             # 查询影子账本 OPEN 仓位
@@ -718,13 +740,7 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
             if not symbol or symbol in synced_symbols:
                 continue
 
-            realized_pnl = float(
-                _flex_trade_attr(
-                    trade,
-                    "fifoPnlRealized", "realizedPL", "realizedPnl", "RealizedP/L",
-                    default=0,
-                ) or 0
-            )
+            realized_pnl = _flex_realized_pnl(trade)
             # 只处理未实现盈亏的（仍持有的）
             if abs(realized_pnl) >= 1e-4:
                 continue
