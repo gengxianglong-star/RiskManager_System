@@ -8,13 +8,17 @@ Flex 权威结算引擎 (CQRS 读取端 / Single Source of Truth)。
   阶段 1 — 已平仓交易（PnL ≠ 0）：匹配影子账本关仓，孤儿单也写入 Notion 供复盘
   阶段 2 — 未平仓交易（PnL = 0）：对照 TWS 实时数据，更新/补录 Notion 持仓信息
 
-内置：MD5 哈希防重、连亏/连赢动态统计、1001/1025 限流保护。
+内置：MD5 哈希防重、连亏/连赢动态统计、IB 官方错误码分级重试。
 """
 
 import asyncio
 import datetime
 import hashlib
+import re
+import ssl
+import urllib.request
 
+import certifi
 import pandas_market_calendars as mcal
 from ib_insync import ExecutionFilter, FlexReport
 from ib_insync.util import formatIBDatetime
@@ -23,6 +27,98 @@ from ai_logger import ai_trace, logger
 from config import CLIENT_ID, FLEX_QUERY_IDS, FLEX_TOKEN, TWS_HOST, resolve_tws_ports
 from database import connect_db, compute_close_journal
 from outbound_queue import enqueue_outbound
+
+# ── SSL 证书修复（与 main.py 一致，避免 Flex HTTPS 在部分环境失败）──
+_ssl_context = ssl.create_default_context(cafile=certifi.where())
+urllib.request.install_opener(
+    urllib.request.build_opener(urllib.request.HTTPSHandler(context=_ssl_context))
+)
+
+# IB Flex Web Service 错误码分级（见 IBKR Campus Flex Web Service 文档）
+_PERMANENT_FLEX_CODES = frozenset({1010, 1011, 1012, 1013, 1015, 1016, 1020})
+_TRANSIENT_FLEX_CODES = frozenset({
+    1001, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1017, 1019, 1021,
+})
+_RATE_LIMIT_CODE = 1018
+_FLEX_RETRY_DELAYS = (8, 12, 20, 30, 45, 60)
+_FLEX_RATE_LIMIT_DELAY = 12
+
+
+def _extract_flex_error_code(err_msg: str) -> int | None:
+    match = re.search(r"\b(10\d{2})\b", err_msg)
+    return int(match.group(1)) if match else None
+
+
+def _download_flex_report_sync(query_id: str) -> FlexReport:
+    """同步拉取 Flex 报表（供 run_in_executor 调用）。"""
+    return FlexReport(FLEX_TOKEN, query_id)
+
+
+async def _download_flex_report(loop: asyncio.AbstractEventLoop, query_id: str) -> FlexReport:
+    """对单个 Query ID 按 IB 官方 pacing 规则退避重试。"""
+    last_err: Exception | None = None
+    max_attempts = len(_FLEX_RETRY_DELAYS) + 1
+
+    for attempt in range(max_attempts):
+        try:
+            return await loop.run_in_executor(
+                None, _download_flex_report_sync, query_id
+            )
+        except Exception as exc:
+            last_err = exc
+            err_msg = str(exc)
+            code = _extract_flex_error_code(err_msg)
+
+            if code in _PERMANENT_FLEX_CODES:
+                raise
+
+            if attempt >= max_attempts - 1:
+                break
+
+            if code == _RATE_LIMIT_CODE:
+                wait = _FLEX_RATE_LIMIT_DELAY
+            elif code in _TRANSIENT_FLEX_CODES or code is None:
+                wait = _FLEX_RETRY_DELAYS[min(attempt, len(_FLEX_RETRY_DELAYS) - 1)]
+            else:
+                wait = _FLEX_RETRY_DELAYS[min(attempt, len(_FLEX_RETRY_DELAYS) - 1)]
+
+            logger.warning(
+                f"Flex Query {query_id} 暂不可用 (code={code}): {err_msg[:80]}... "
+                f"{wait}s 后重试 ({attempt + 1}/{max_attempts})"
+            )
+            await asyncio.sleep(wait)
+
+    assert last_err is not None
+    raise last_err
+
+
+async def _fetch_flex_report(loop: asyncio.AbstractEventLoop) -> FlexReport:
+    """拉取 Flex 报表；同一 Token 下优先对单个 Query 充分重试，仅在 Query 无效时切换。"""
+    last_err: Exception | None = None
+
+    for idx, qid in enumerate(FLEX_QUERY_IDS):
+        try:
+            report = await _download_flex_report(loop, qid)
+            logger.info(f"🧾 [Flex] Query {qid} 成功拉取报表")
+            return report
+        except Exception as exc:
+            last_err = exc
+            code = _extract_flex_error_code(str(exc))
+            if code in (1012, 1013, 1015, 1011, 1010):
+                raise
+            if code == 1014 and idx < len(FLEX_QUERY_IDS) - 1:
+                logger.warning(f"Query {qid} 无效 (1014)，尝试下一个 Query ID...")
+                await asyncio.sleep(10)
+                continue
+            if idx < len(FLEX_QUERY_IDS) - 1:
+                logger.warning(f"Query {qid} 拉取失败，10s 后尝试下一个 Query ID...")
+                await asyncio.sleep(10)
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+    raise RuntimeError("未配置可用的 Flex Query ID")
 
 
 # ── Executions 回退引擎内部锁池（避免循环引用 main.py）──
@@ -321,54 +417,22 @@ async def run_flex_settlement(tg_notify_func=None, ib=None):
         logger.info("近期无有效交易日，跳过 Flex 结算。")
         return
 
-    logger.info(f"🧾 [Flex Settlement] 开始拉取 IBKR 官方结算报表 (轮询池: {len(FLEX_QUERY_IDS)} 个 Query)...")
+    logger.info(
+        f"🧾 [Flex Settlement] 开始拉取 IBKR 官方结算报表 "
+        f"(Query 池: {len(FLEX_QUERY_IDS)} 个，主 Query: {FLEX_QUERY_IDS[0]})..."
+    )
 
     loop = asyncio.get_running_loop()
     report = None
 
-    # ── Query ID 轮询池：逐个尝试，限流时自动切换下一个（带退避延迟）──
-    for idx, qid in enumerate(FLEX_QUERY_IDS):
-        rate_limited = False
-        for flex_attempt in range(2):
-            try:
-                report = await loop.run_in_executor(
-                    None, lambda q=qid: FlexReport(FLEX_TOKEN, q)
-                )
-                logger.info(f"🧾 [Flex] Query {qid} 成功拉取报表")
-                break
-            except Exception as fe:
-                err_msg = str(fe)
-                if any(kw in err_msg for kw in ("1001", "1025", "1019")):
-                    rate_limited = True
-                    logger.warning(
-                        f"⚠️ Query {qid} 限流 ({err_msg[:60]})，"
-                        f"切换轮询池下一个..."
-                    )
-                    break  # 跳出内层重试，尝试下一个 Query ID
-                retryable = any(kw in err_msg.lower() for kw in (
-                    "could not be generated", "ssl", "eof",
-                    "timeout", "connection",
-                ))
-                if retryable and flex_attempt < 1:
-                    wait = 20 * (flex_attempt + 1)
-                    logger.warning(
-                        f"Flex 报表未就绪 (Query {qid}): {err_msg[:80]}... "
-                        f"{wait}s 后重试 ({flex_attempt + 1}/2)"
-                    )
-                    await asyncio.sleep(wait)
-                else:
-                    logger.error(f"Flex 报表致命错误 (Query {qid}): {err_msg}")
-                    break  # 放弃当前 query_id
-        if report is not None:
-            break  # 成功，退出轮询
-        # ── 退避延迟：非最后一个 Query 且触发限流 → 等 5s 避免打满 Token 速率 ──
-        if rate_limited and idx < len(FLEX_QUERY_IDS) - 1:
-            logger.info(f"⏳ Query {qid} 触发限流，等待 5s 冷却后再试下一个...")
-            await asyncio.sleep(5.0)
+    try:
+        report = await _fetch_flex_report(loop)
+    except Exception as fe:
+        logger.error(f"Flex 报表拉取失败: {fe}")
 
-    # ── 所有 Query ID 均失败 → 降级为 Executions 应急通道 ──
+    # ── Flex 失败 → 降级为 Executions 应急通道 ──
     if report is None:
-        logger.warning("⚠️ 所有 Query ID 均限流或失败，自动降级为 Executions 应急通道...")
+        logger.warning("⚠️ Flex 报表拉取失败，自动降级为 Executions 应急通道...")
 
         # ── 自愈重连：TWS 断线时尝试强制唤醒，打破单点故障 ──
         connected = ib and ib.isConnected()

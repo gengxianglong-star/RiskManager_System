@@ -462,9 +462,9 @@ async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("收到手动强制原生结算指令。")
-    await app_context.sync_tws_settlement_job()
-    await update.message.reply_text("✅ TWS 原生结算对账已触发。")
+    logger.info("收到手动 Flex 权威结算指令。")
+    await app_context.sync_flex_settlement_job()
+    await update.message.reply_text("✅ Flex 权威结算已触发（失败将自动降级 TWS Executions）。")
 
 
 @require_auth

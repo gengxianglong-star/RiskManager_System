@@ -17,13 +17,10 @@ DESKTOP_SETTINGS_PATH = Path.home() / ".ibkr-order-tool" / "settings.json"
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))  # TWS API Client ID，避免与桌面端冲突
 FLEX_TOKEN = os.getenv("FLEX_TOKEN", "YOUR_FLEX_TOKEN")
 FLEX_QUERY_ID = os.getenv("FLEX_QUERY_ID", "1562873")
-# ── Query ID 轮询池：防止单个 Query 频繁触发 1001/1025 限流 ──
+# ── Query ID：建议只配 1 个专用 Activity Flex Query（与 TradeZella 使用独立 Token）──
 FLEX_QUERY_IDS = [
     qid.strip()
-    for qid in os.getenv(
-        "FLEX_QUERY_IDS",
-        "1562873,1568627,1568630",
-    ).split(",")
+    for qid in os.getenv("FLEX_QUERY_IDS", os.getenv("FLEX_QUERY_ID", "")).split(",")
     if qid.strip()
 ]
 NOTION_TOKEN = os.getenv("NOTION_TOKEN", "YOUR_NOTION_TOKEN")

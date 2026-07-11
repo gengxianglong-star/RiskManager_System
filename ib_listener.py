@@ -104,7 +104,7 @@ class IBKRListener:
             await asyncio.sleep(15)
 
     async def _on_tws_reconnect(self):
-        """TWS 恢复连接后自动补齐：仓位对账 + TWS 原生结算。"""
+        """TWS 恢复连接后自动补齐：仓位对账 + Flex 权威结算。"""
         logger.info("🔄 TWS 重连：开始自动补齐...")
         await asyncio.sleep(2)
         try:
@@ -112,7 +112,7 @@ class IBKRListener:
             await reconcile_physical_positions(self.ib, self.gateway.notify_user)
         except Exception as e:
             logger.error(f"重连对账失败: {e}")
-        self.ctx.spawn_background_task(self.ctx.sync_tws_settlement_job())
+        self.ctx.spawn_background_task(self.ctx.sync_flex_settlement_job())
 
     # ── 行情拉取 ──
 
