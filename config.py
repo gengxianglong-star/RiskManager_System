@@ -6,8 +6,6 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-MY_TELEGRAM_CHAT_ID = int(os.getenv("MY_TELEGRAM_CHAT_ID", "123456789"))
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "YOUR_TG_TOKEN")
 TWS_HOST = os.getenv("TWS_HOST", "127.0.0.1")
 # 兼容旧配置；优先跟随桌面端 ~/.ibkr-order-tool/settings.json
 TWS_PORT = int(os.getenv("TWS_PORT", "7497"))
@@ -26,8 +24,6 @@ FLEX_QUERY_IDS = [
     ).split(",")
     if qid.strip()
 ]
-NOTION_TOKEN = os.getenv("NOTION_TOKEN", "YOUR_NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "YOUR_NOTION_DATABASE_ID")
 DB_PATH = os.getenv("DB_PATH", "risk_manager.db")
 DB_TIMEOUT = float(os.getenv("DB_TIMEOUT", "10.0"))
 
@@ -63,22 +59,30 @@ MAX_DAILY_TRADES = int(os.getenv("MAX_DAILY_TRADES", "3"))
 # 总隔夜风险上限 (占净值比例，推荐 0.015 即 1.5%)
 MAX_OVERNIGHT_RISK_PCT = float(os.getenv("MAX_OVERNIGHT_RISK_PCT", "0.015"))
 
+# ── RiskCore 定稿契约（与 risk_core.constants 对齐）──
+MIN_CUSHION = float(os.getenv("MIN_CUSHION", "0.10"))
+MIN_RISK_PER_SHARE = float(os.getenv("MIN_RISK_PER_SHARE", "1.0"))
+MIN_ENTRY_PRICE = float(os.getenv("MIN_ENTRY_PRICE", "5.0"))
+MATERIAL_DEPLETION_PCT = float(os.getenv("MATERIAL_DEPLETION_PCT", "0.05"))
+AVG_COST_DRIFT_PCT = float(os.getenv("AVG_COST_DRIFT_PCT", "0.20"))
+MAX_SYNC_GAP_DAYS = int(os.getenv("MAX_SYNC_GAP_DAYS", "7"))
+IN_FLIGHT_TTL_SEC = float(os.getenv("IN_FLIGHT_TTL_SEC", "30.0"))
+POSITION_SYNC_WARMUP_SEC = float(os.getenv("POSITION_SYNC_WARMUP_SEC", "3.0"))
+ALLOWED_CURRENCY = os.getenv("ALLOWED_CURRENCY", "USD")
+ALLOWED_SEC_TYPE = os.getenv("ALLOWED_SEC_TYPE", "STK")
+IB_EXEC_TIMEZONE = os.getenv("IB_EXEC_TIMEZONE", "")
+ALLOWED_ENTRY_ORDER_TYPES = frozenset(
+    t.strip().upper()
+    for t in os.getenv("ALLOWED_ENTRY_ORDER_TYPES", "LMT,STP LMT,STP").split(",")
+    if t.strip()
+)
+
 # ==========================================
 # 部署环境与高级引擎开关 (Deployment & Engine Toggles)
 # ==========================================
 
-# EOD 10EMA 狙击手开关。
-# - 本地关机模式 (False): 依靠 TWS 物理止损单防守，忽略收盘破位。
-# - 云端 VPS 模式 (True): 24 小时在线，美东 15:55 准时执行日线破位审判。
-ENABLE_EOD_SNIPER = os.getenv("ENABLE_EOD_SNIPER", "false").lower() in (
-    "1",
-    "true",
-    "yes",
-)
-
 # ====== 提取硬编码参数与日志配置 ======
 THRESHOLD_3R = float(os.getenv("THRESHOLD_3R", "3.0"))          # 3R爆发提醒阈值
-EMA_PERIOD = int(os.getenv("EMA_PERIOD", "10"))                 # 均线狙击手周期
 FORCE_CONFESSION_HOUR = int(os.getenv("FORCE_CONFESSION_HOUR", "23")) # 强制坦白触发时间(小时)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")                      # 系统日志级别
 

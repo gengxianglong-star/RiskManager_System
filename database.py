@@ -79,6 +79,8 @@ async def ensure_schema() -> None:
             ("mfe_pct", "REAL DEFAULT 0.0"),
             ("journal_note", "TEXT DEFAULT ''"),
             ("exit_time", "TEXT DEFAULT ''"),
+            ("perm_id", "INTEGER DEFAULT 0"),
+            ("entry_exec_id", "TEXT DEFAULT ''"),
         ]
         for col_name, col_def in _journal_cols:
             try:
@@ -219,6 +221,7 @@ async def ensure_schema() -> None:
         # 出站队列表（复用当前连接，避免锁冲突）
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA busy_timeout=15000;")
+        # legacy table retained to avoid breaking existing DBs; no longer written to
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS outbound_queue (
@@ -282,6 +285,7 @@ async def ensure_schema() -> None:
             "liquidation INTEGER DEFAULT 0",
             "cum_qty REAL DEFAULT 0",
             "con_id INTEGER DEFAULT 0",
+            "realized_pnl REAL",
         ):
             try:
                 await db.execute(f"ALTER TABLE tws_fills ADD COLUMN {col_def}")
@@ -404,6 +408,39 @@ async def ensure_schema() -> None:
             """
         )
 
+        # 近实时风控快照（ibkr-order-tool 轮询；单行 id='primary'）
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS risk_runtime_snapshot (
+                id                   TEXT PRIMARY KEY,
+                updated_at           TEXT NOT NULL,
+                nlv                  REAL DEFAULT 0,
+                hwm                  REAL DEFAULT 0,
+                hwm_drawdown_pct     REAL DEFAULT 0,
+                month_peak_nlv       REAL DEFAULT 0,
+                month_ym             TEXT DEFAULT '',
+                month_drawdown_pct   REAL DEFAULT 0,
+                consecutive_losses   INTEGER DEFAULT 0,
+                daily_opens          INTEGER DEFAULT 0,
+                open_risk_usd        REAL DEFAULT 0,
+                open_risk_pct        REAL DEFAULT 0,
+                risk_cap_usd         REAL DEFAULT 0,
+                over_risk            INTEGER DEFAULT 0,
+                risk_light           TEXT DEFAULT '',
+                risk_budget          REAL DEFAULT 0,
+                max_position_r       REAL DEFAULT 0,
+                has_over_3r          INTEGER DEFAULT 0,
+                cushion              REAL DEFAULT 0,
+                positions_json       TEXT DEFAULT '[]',
+                stale                INTEGER DEFAULT 0
+            )
+            """
+        )
+
+        from risk_core import store as risk_core_store
+
+        await risk_core_store.ensure_risk_core_schema(db)
+
         await db.commit()
 
 
@@ -488,6 +525,47 @@ async def count_open_tranches(conn, symbol):
     return int(row[0])
 
 
+async def ledger_open_exists_for_fill(
+    conn: aiosqlite.Connection,
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    perm_id: int = 0,
+    exec_id: str = "",
+    day_start_utc: str = "",
+    day_end_utc: str = "",
+) -> bool:
+    """开仓账本是否已记录该笔成交（perm_id / exec_id / 同日同价同量指纹）。"""
+    if perm_id and perm_id > 0:
+        cur = await conn.execute(
+            "SELECT 1 FROM shadow_ledger WHERE perm_id=? LIMIT 1",
+            (perm_id,),
+        )
+        if await cur.fetchone():
+            return True
+    if exec_id:
+        cur = await conn.execute(
+            "SELECT 1 FROM shadow_ledger WHERE entry_exec_id=? LIMIT 1",
+            (exec_id,),
+        )
+        if await cur.fetchone():
+            return True
+    if day_start_utc and day_end_utc and price > 0:
+        cur = await conn.execute(
+            "SELECT 1 FROM shadow_ledger WHERE symbol=? AND side=? AND status='OPEN' "
+            "AND create_time >= ? AND create_time < ? "
+            "AND ABS(quantity - ?) < 0.01 "
+            "AND ABS(entry_price - ?) / ? < 0.001 "
+            "LIMIT 1",
+            (symbol, side, day_start_utc, day_end_utc, qty, price, price),
+        )
+        if await cur.fetchone():
+            return True
+    return False
+
+
 async def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price, quantity, spy_context):
     tranche_num = await count_open_tranches(conn, symbol) + 1
     tranche_id = f"T{tranche_num}"
@@ -501,42 +579,26 @@ async def insert_shadow_ledger(conn, symbol, stop_price, setup_tag, entry_price,
     return int(cur.lastrowid)
 
 
-async def get_today_trade_count(conn) -> int:
-    """获取今日已确认建仓的次数 (狙击手协议)，按 TRADING_TZ 日切。
-
-    🚨 排除系统自动收编的仓位 (TWS_SYNC / IMPORT)，不消耗每日弹夹额度。
-    """
-    tz = ZoneInfo(TRADING_TZ)
-    now = datetime.datetime.now(tz)
-    day_start = datetime.datetime.combine(now.date(), datetime.time.min, tzinfo=tz)
-    day_end = day_start + datetime.timedelta(days=1)
-    start_utc = day_start.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    end_utc = day_end.astimezone(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    cur = await conn.execute(
-        "SELECT COUNT(*) FROM shadow_ledger "
-        "WHERE create_time >= ? AND create_time < ? "
-        "AND setup_tag NOT IN ('TWS_SYNC', 'IMPORT')",
-        (start_utc, end_utc),
-    )
-    row = await cur.fetchone()
-    return int(row[0]) if row else 0
-
-
 # ════════════════════════════════════════════════════════════════
 # Journal 辅助函数：消除跨文件重复的 r_multiple / holding_days 计算
 # ════════════════════════════════════════════════════════════════
-
 
 def extract_tws_fill_fields(fill_row: dict) -> dict:
     """从 tws_fills 行提取 journal 列值，供 INSERT 路径复用。
 
     fill_row 是 sqlite3.Row 或普通 dict，包含 tws_fills 表的所有列。
     """
+    rpnl = fill_row.get("realized_pnl")
+    try:
+        rpnl_f = float(rpnl) if rpnl is not None else None
+    except (TypeError, ValueError):
+        rpnl_f = None
     return {
         "exec_time": fill_row.get("exec_time", "") or "",
         "order_type": fill_row.get("order_type", "") or "",
         "exchange": fill_row.get("exchange", "") or "",
         "commissions": float(fill_row.get("commission") or 0),
+        "realized_pnl": rpnl_f,
     }
 
 

@@ -48,7 +48,7 @@ def _build_mock_connection(cursors: list):
 
 
 def _risk_engine():
-    """创建一个不需要真实 IB/Telegram 依赖的最小 RiskEngine 桩。"""
+    """创建一个不需要真实 IB/网关依赖的最小 RiskEngine 桩。"""
     return RiskEngine(context=None, ib_listener=None, gateway=None)
 
 

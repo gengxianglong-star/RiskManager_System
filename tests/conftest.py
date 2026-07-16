@@ -1,23 +1,17 @@
 """pytest 全局配置 + 异步数据库 fixture。
 
-每个测试获得独立的 :memory: SQLite schema（function 级别隔离）。
-通过 monkeypatch aiosqlite.connect 将 :memory: 转为共享内存 URI，
-确保 ensure_schema + 测试代码的多次 connect_db() 调用访问同一个逻辑库。
+每个测试获得独立的临时文件 SQLite schema（function 级别隔离）。
+用临时文件而非 :memory:，因为共享缓存内存库在连接全部关闭后会被销毁，
+在 Windows 上会导致 ensure_schema 建表后的下一次 connect 读到空库。
+临时文件库能保证 ensure_schema + 测试多次 connect_db() 访问同一逻辑库。
 """
 
-import aiosqlite as _aiosqlite
+import os
+import tempfile
+import uuid
+
 import pytest_asyncio
 from contextlib import asynccontextmanager
-
-
-_ORIG_AIOSQLITE_CONNECT = _aiosqlite.connect
-
-
-async def _shared_memory_connect(db_path: str, **kwargs):
-    """将 :memory: 转为 file::memory:?cache=shared，跨连接共享同一个内存库。"""
-    if db_path == ":memory:":
-        db_path = "file::memory:?cache=shared"
-    return await _ORIG_AIOSQLITE_CONNECT(db_path, **kwargs)
 
 
 @asynccontextmanager
@@ -37,12 +31,13 @@ async def async_test_db():
     _orig_timeout_cfg = config.DB_TIMEOUT
     _orig_timeout_db = database.DB_TIMEOUT
 
-    config.DB_PATH = ":memory:"
-    database.DB_PATH = ":memory:"
-    config.DB_TIMEOUT = 1.0
-    database.DB_TIMEOUT = 1.0
-
-    _aiosqlite.connect = _shared_memory_connect
+    tmp_path = os.path.join(
+        tempfile.gettempdir(), f"rm_test_{uuid.uuid4().hex}.db"
+    )
+    config.DB_PATH = tmp_path
+    database.DB_PATH = tmp_path
+    config.DB_TIMEOUT = 5.0
+    database.DB_TIMEOUT = 5.0
 
     try:
         await ensure_schema()
@@ -54,7 +49,8 @@ async def async_test_db():
                          "daily_reviews", "applied_splits",
                          "flex_processed_execs", "tws_fills", "fill_processed",
                          "notion_queue", "trade_tags", "trade_reviews",
-                         "market_snapshots", "stop_adjustments"):
+                         "market_snapshots", "stop_adjustments",
+                         "risk_runtime_snapshot"):
                 try:
                     await _cleanup_conn.execute(f"DELETE FROM {_tbl}")
                 except Exception:
@@ -75,11 +71,15 @@ async def async_test_db():
         yield get_conn
 
     finally:
-        _aiosqlite.connect = _ORIG_AIOSQLITE_CONNECT
         config.DB_PATH = _orig_path_cfg
         database.DB_PATH = _orig_path_db
         config.DB_TIMEOUT = _orig_timeout_cfg
         database.DB_TIMEOUT = _orig_timeout_db
+        for _suffix in ("", "-wal", "-shm"):
+            try:
+                os.remove(tmp_path + _suffix)
+            except OSError:
+                pass
 
 
 @pytest_asyncio.fixture(scope="function")

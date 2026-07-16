@@ -1,9 +1,8 @@
 @echo off
-title 极致动量风控军师系统
+title RiskManager (已归档)
 echo =========================================
-echo 🤖 正在启动风控军师系统...
-echo ⚠️ 请确保 TWS 客户端已登录并开启 API 端口
+echo RiskManager 独立守护已停用
+echo 请打开 ibkr-order-tool 并勾选 RiskCore
 echo =========================================
-timeout /t 3
 python main.py
 pause

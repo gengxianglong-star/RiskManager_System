@@ -21,13 +21,16 @@ from tws_settlement import TWSSettlement, run_tws_settlement
 
 async def _seed_fill(db, exec_id, symbol, side, qty, price,
                      exec_time="2026-07-10T10:00:00", processed=0,
-                     order_ref="", order_type="", aux_price=0.0):
+                     order_ref="", order_type="", aux_price=0.0,
+                     perm_id=None):
+    if perm_id is None:
+        perm_id = abs(hash(exec_id)) % 10_000_000
     await db.execute(
         "INSERT OR IGNORE INTO tws_fills "
-        "(exec_id, symbol, side, quantity, price, exec_time, "
+        "(exec_id, perm_id, symbol, side, quantity, price, exec_time, "
         "order_ref, order_type, aux_price, processed) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (exec_id, symbol, side, qty, price, exec_time,
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (exec_id, perm_id, symbol, side, qty, price, exec_time,
          order_ref, order_type, aux_price, processed),
     )
 
@@ -306,3 +309,232 @@ async def test_settlement_idempotent(async_db):
 
     c2, _ = await engine._phase1_fifo_settle()
     assert c2 == 0
+
+
+@pytest.mark.asyncio
+async def test_no_reverse_open_when_tws_flat(async_db):
+    """幽灵平仓后残留的 STP 卖出：TWS 已空仓 → 不得再建 SHORT。"""
+    engine = TWSSettlement()
+    async with async_db() as db:
+        await db.execute(
+            "INSERT INTO shadow_ledger "
+            "(symbol, tranche_id, side, quantity, entry_price, initial_stop, "
+            "current_stop, status, setup_tag, exit_price, realized_pnl, exit_reason) "
+            "VALUES ('TSLL','T1','LONG',1126,12.297,12.07,12.07,'CLOSED',"
+            "'Breakout',12.297,0,'STOP_HIT')"
+        )
+        await _seed_fill(
+            db, "exec_stp", "TSLL", "SHORT", 1126, 12.135, order_type="STP"
+        )
+        await db.commit()
+
+    closed, pnl = await engine._phase1_fifo_settle(physical_inventory={})
+    assert closed >= 1
+    assert abs(pnl - (12.135 - 12.297) * 1126) < 0.5
+
+    async with async_db() as db:
+        cur = await db.execute(
+            "SELECT status, side, exit_price, realized_pnl FROM shadow_ledger "
+            "WHERE symbol='TSLL' ORDER BY id"
+        )
+        rows = await cur.fetchall()
+        assert all(r[0] == "CLOSED" for r in rows)
+        assert not any(r[0] == "OPEN" for r in rows)
+        long_row = rows[0]
+        assert abs(float(long_row[2]) - 12.135) < 0.001
+        assert float(long_row[3]) < 0
+
+
+@pytest.mark.asyncio
+async def test_recover_orphan_roundtrip(async_db):
+    """已 processed 的买卖配对若账本缺失 → 回收为 CLOSED 并计入盈亏。"""
+    from tws_settlement import _recover_orphan_roundtrips, _recount_consecutive_losses
+
+    async with async_db() as db:
+        db.row_factory = __import__("aiosqlite").Row
+        await _seed_fill(
+            db, "e_b", "AMD", "LONG", 21, 566.8, processed=2,
+            order_ref="UI_MANUAL", order_type="MKT",
+            exec_time="2026-07-14T13:33:56+00:00",
+        )
+        await _seed_fill(
+            db, "e_s", "AMD", "SHORT", 21, 564.22, processed=2,
+            order_ref="UI_MANUAL", order_type="STP",
+            exec_time="2026-07-14T13:34:21+00:00",
+        )
+        await db.commit()
+        n, pnl = await _recover_orphan_roundtrips(db, days=30)
+        assert n == 1
+        assert pnl < 0
+        streak = await _recount_consecutive_losses(db)
+        await db.commit()
+        assert streak >= 1
+        cur = await db.execute(
+            "SELECT status, realized_pnl FROM shadow_ledger WHERE symbol='AMD'"
+        )
+        row = await cur.fetchone()
+        assert row[0] == "CLOSED"
+        assert float(row[1]) < 0
+
+
+@pytest.mark.asyncio
+async def test_recover_identical_lots_same_exit(async_db):
+    """两份同价开仓 + 一次合卖：应两笔 CLOSED，不被「相似平仓」误跳。"""
+    from tws_settlement import _recover_orphan_roundtrips
+
+    async with async_db() as db:
+        db.row_factory = __import__("aiosqlite").Row
+        for i, eid in enumerate(("mu_b1", "mu_b2")):
+            await _seed_fill(
+                db, eid, "MU", "LONG", 6, 961.615, processed=2,
+                order_ref="UI_MANUAL", order_type="MKT",
+                exec_time="2026-07-14T14:13:04+00:00",
+                perm_id=1000 + i,
+            )
+        await _seed_fill(
+            db, "mu_s", "MU", "SHORT", 12, 956.43, processed=2,
+            order_ref="UI_MANUAL", order_type="STP",
+            exec_time="2026-07-14T14:15:01+00:00",
+        )
+        # 已回收一半时，应再补另一半，总 qty=12
+        await db.execute(
+            "INSERT INTO shadow_ledger "
+            "(symbol, tranche_id, side, quantity, entry_price, "
+            "initial_stop, current_stop, status, setup_tag, "
+            "exit_price, realized_pnl, exit_time) "
+            "VALUES ('MU', 'T_RT_half', 'LONG', 6, 961.615, 0, 0, "
+            "'CLOSED', 'UI_MANUAL', 956.43, -31.11, "
+            "'2026-07-14T14:15:01+00:00')"
+        )
+        await db.commit()
+        n, pnl = await _recover_orphan_roundtrips(db, days=30)
+        assert n == 1
+        assert abs(pnl - (-31.11)) < 0.05
+        cur = await db.execute(
+            "SELECT SUM(quantity), SUM(realized_pnl) FROM shadow_ledger "
+            "WHERE symbol='MU' AND status='CLOSED' "
+            "AND substr(exit_time,1,19)='2026-07-14T14:15:01'"
+        )
+        row = await cur.fetchone()
+        assert abs(float(row[0]) - 12.0) < 0.01
+        assert abs(float(row[1]) - (-62.22)) < 0.1
+
+
+@pytest.mark.asyncio
+async def test_recover_does_not_remap_prior_booked_lot(async_db):
+    """先有一轮已记账 round-trip 时，后一轮不该吃到上一轮残留开仓价。"""
+    from tws_settlement import _recover_orphan_roundtrips
+
+    async with async_db() as db:
+        db.row_factory = __import__("aiosqlite").Row
+        await _seed_fill(
+            db, "a1", "MU", "LONG", 17, 971.11, processed=2,
+            exec_time="2026-07-14T14:03:51+00:00",
+        )
+        await _seed_fill(
+            db, "a2", "MU", "SHORT", 17, 967.11, processed=2,
+            exec_time="2026-07-14T14:05:12+00:00",
+        )
+        await _seed_fill(
+            db, "b1", "MU", "LONG", 6, 961.615, processed=2,
+            exec_time="2026-07-14T14:13:04+00:00", perm_id=1,
+        )
+        await _seed_fill(
+            db, "b2", "MU", "LONG", 6, 961.615, processed=2,
+            exec_time="2026-07-14T14:13:04+00:00", perm_id=2,
+        )
+        await _seed_fill(
+            db, "b3", "MU", "SHORT", 12, 956.43, processed=2,
+            exec_time="2026-07-14T14:15:01+00:00",
+        )
+        # 第一轮已完整入账；第二轮只入账一半
+        await db.execute(
+            "INSERT INTO shadow_ledger "
+            "(symbol, tranche_id, side, quantity, entry_price, "
+            "initial_stop, current_stop, status, setup_tag, "
+            "exit_price, realized_pnl, exit_time) VALUES "
+            "('MU','T1','LONG',17,971.11,0,0,'CLOSED','UI',967.11,-68,"
+            "'2026-07-14T14:05:12+00:00')"
+        )
+        await db.execute(
+            "INSERT INTO shadow_ledger "
+            "(symbol, tranche_id, side, quantity, entry_price, "
+            "initial_stop, current_stop, status, setup_tag, "
+            "exit_price, realized_pnl, exit_time) VALUES "
+            "('MU','T2','LONG',6,961.615,0,0,'CLOSED','UI',956.43,-31.11,"
+            "'2026-07-14T14:15:01+00:00')"
+        )
+        await db.commit()
+        n, pnl = await _recover_orphan_roundtrips(db, days=30)
+        assert n == 1
+        assert abs(pnl - (-31.11)) < 0.05
+        cur = await db.execute(
+            "SELECT entry_price, quantity, realized_pnl FROM shadow_ledger "
+            "WHERE symbol='MU' AND status='CLOSED' "
+            "AND substr(exit_time,1,19)='2026-07-14T14:15:01' "
+            "ORDER BY id"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 2
+        assert all(abs(float(r[0]) - 961.615) < 0.01 for r in rows)
+        assert abs(sum(float(r[1]) for r in rows) - 12.0) < 0.01
+
+
+@pytest.mark.asyncio
+async def test_recover_skips_zero_qty_closed_with_pnl(async_db):
+    """旧账本 quantity=0 但已记盈亏 → 不得再回收同一出场时刻。"""
+    from tws_settlement import _recover_orphan_roundtrips
+
+    async with async_db() as db:
+        db.row_factory = __import__("aiosqlite").Row
+        await _seed_fill(
+            db, "hb", "HOOD", "LONG", 120, 112.1595, processed=2,
+            exec_time="2026-07-10T13:46:15+00:00",
+        )
+        await _seed_fill(
+            db, "hs", "HOOD", "SHORT", 120, 111.2605, processed=2,
+            exec_time="2026-07-10T13:57:58+00:00",
+        )
+        await db.execute(
+            "INSERT INTO shadow_ledger "
+            "(symbol, tranche_id, side, quantity, entry_price, "
+            "initial_stop, current_stop, status, setup_tag, "
+            "exit_price, realized_pnl, exit_time) VALUES "
+            "('HOOD','Told','LONG',0,112.1595,0,0,'CLOSED','TWS_SYNC',"
+            "111.2605,-107.88,'2026-07-10T13:57:58+00:00')"
+        )
+        await db.commit()
+        n, pnl = await _recover_orphan_roundtrips(db, days=30)
+        assert n == 0
+        assert abs(pnl) < 1e-9
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM shadow_ledger WHERE symbol='HOOD' AND status='CLOSED'"
+        )
+        assert (await cur.fetchone())[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_phase1_implicit_buffer_pairs_flat_daytrade(async_db):
+    """TWS 空仓时，先后 LONG/SHORT 未处理成交应配对关闭，不建幽灵仓。"""
+    engine = TWSSettlement()
+    async with async_db() as db:
+        await _seed_fill(
+            db, "imp_b", "SNDK", "LONG", 6, 1773.545, processed=0,
+            order_type="MKT", exec_time="2026-07-14T14:00:17+00:00",
+        )
+        await _seed_fill(
+            db, "imp_s", "SNDK", "SHORT", 6, 1760.14, processed=0,
+            order_type="STP", exec_time="2026-07-14T14:01:26+00:00",
+        )
+        await db.commit()
+
+    closed, pnl = await engine._phase1_fifo_settle(physical_inventory={})
+    assert closed >= 1
+    assert pnl < 0
+    async with async_db() as db:
+        cur = await db.execute(
+            "SELECT status FROM shadow_ledger WHERE symbol='SNDK'"
+        )
+        rows = await cur.fetchall()
+        assert len(rows) == 1 and rows[0][0] == "CLOSED"
+        assert not any(r[0] == "OPEN" for r in rows)

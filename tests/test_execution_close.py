@@ -34,23 +34,6 @@ sys.modules["eventkit"] = Mock()
 from ib_listener import IBKRListener, _apply_consecutive_losses
 from tests.conftest import async_test_db
 
-# ═══════════════════════════════════════════════════════════════
-# Patches — 隔离外部依赖
-# ═══════════════════════════════════════════════════════════════
-
-import ib_listener as _ib_listener_mod
-
-_original_enqueue = _ib_listener_mod.enqueue_outbound
-
-
-def _patch_outbound():
-    """将 ib_listener 模块中的 enqueue_outbound 替换为 AsyncMock。"""
-    _ib_listener_mod.enqueue_outbound = AsyncMock()
-
-
-def _restore_outbound():
-    _ib_listener_mod.enqueue_outbound = _original_enqueue
-
 
 # ═══════════════════════════════════════════════════════════════
 # 辅助工具
@@ -90,15 +73,18 @@ def _build_mock_listener():
     ctx.ib.openTrades = Mock(side_effect=RuntimeError("OPEN path: must not call ib.openTrades"))
 
     gateway = Mock()
-    gateway.notify_user = AsyncMock(side_effect=RuntimeError("OPEN path: must not call notify_user"))
+    gateway.notify_user = AsyncMock()  # CLOSE 路径也会通知
 
     listener = IBKRListener.__new__(IBKRListener)
     listener.ctx = ctx
     listener.gateway = gateway
     listener.ib = ctx.ib
-    listener.fetch_account_equity = AsyncMock(
-        side_effect=RuntimeError("OPEN path: must not call fetch_account_equity")
-    )
+    from ib_market import QuoteHub
+    listener.quotes = QuoteHub(ctx.ib)
+    listener._streak_applied_execs = set()
+    listener._pending_pnl_alloc = {}
+    # 净值偏低 → scratch 阈值 ~$10，亏损平仓可计入连亏
+    listener.fetch_account_equity = AsyncMock(return_value=10_000.0)
     return listener
 
 
@@ -108,21 +94,42 @@ def _make_trade(symbol: str = SYMBOL):
     t.order = Mock()
     t.order.orderRef = ""
     t.order.orderType = "STP"          # ≠ "LMT" → night_watchman 立即返回
+    t.order.tif = ""
     t.order.permId = 99999
     t.contract = Mock()
     t.contract.symbol = symbol
     return t
 
 
-def _make_fill(symbol: str, side: str, shares: float, price: float):
-    """构造 mock ib_insync Fill 对象。"""
+def _make_fill(symbol: str, side: str, shares: float, price: float,
+               entry: float = INITIAL_ENTRY):
+    """构造 mock Fill；附带 TWS commissionReport.realizedPNL。"""
     f = Mock()
     f.execution = Mock()
     f.execution.side = side      # "BOT" = 买入, "SLD" = 卖出
     f.execution.shares = shares
     f.execution.price = price
+    f.execution.time = None
+    f.execution.exchange = ""
+    f.execution.execId = f"exec-{side}-{shares}-{price}"
+    f.execution.permId = 99999
+    f.execution.orderId = 1
+    f.execution.liquidation = 0
+    f.execution.cumQty = shares
     f.contract = Mock()
     f.contract.symbol = symbol
+    f.contract.conId = 123
+    cr = Mock()
+    cr.commission = 1.0
+    # LONG 平仓=SELL → (px-entry)*qty；SHORT 平仓=BOT → (entry-px)*qty
+    if side == "SLD":
+        cr.realizedPNL = (price - entry) * shares
+    elif side == "BOT":
+        # 测试里 BOT 多作加仓；开仓腿用哨兵
+        cr.realizedPNL = 1e100
+    else:
+        cr.realizedPNL = 0.0
+    f.commissionReport = cr
     return f
 
 
@@ -160,90 +167,83 @@ async def test_fifo_close_with_random_fills(fill_qty, fill_price):
     fill_qty = round(fill_qty, 4)
     fill_price = round(fill_price, 2)
 
-    _patch_outbound()
-    try:
-        async with async_test_db() as get_conn:
-            async with get_conn() as conn:
-                await _seed_open_position(conn)
+    async with async_test_db() as get_conn:
+        async with get_conn() as conn:
+            await _seed_open_position(conn)
 
-            listener = _build_mock_listener()
-            trade = _make_trade()
-            fill = _make_fill(SYMBOL, "SLD", fill_qty, fill_price)
+        listener = _build_mock_listener()
+        trade = _make_trade()
+        fill = _make_fill(SYMBOL, "SLD", fill_qty, fill_price)
 
-            await listener._async_on_execution(trade, fill)
+        await listener._async_on_execution(trade, fill)
 
-            async with get_conn() as conn:
-                conn.row_factory = aiosqlite.Row
-                cur = await conn.execute(
-                    "SELECT id, side, quantity, entry_price, status, exit_price, realized_pnl "
-                    "FROM shadow_ledger WHERE symbol=? ORDER BY id",
-                    (SYMBOL,),
-                )
-                rows = await cur.fetchall()
+        async with get_conn() as conn:
+            conn.row_factory = aiosqlite.Row
+            cur = await conn.execute(
+                "SELECT id, side, quantity, entry_price, status, exit_price, realized_pnl "
+                "FROM shadow_ledger WHERE symbol=? ORDER BY id",
+                (SYMBOL,),
+            )
+            rows = await cur.fetchall()
 
-            open_rows = [r for r in rows if r["status"] == "OPEN"]
-            closed_rows = [r for r in rows if r["status"] == "CLOSED"]
+        open_rows = [r for r in rows if r["status"] == "OPEN"]
+        closed_rows = [r for r in rows if r["status"] == "CLOSED"]
 
-            if fill_qty < INITIAL_QTY:
-                assert len(open_rows) == 1, f"部分平仓应保留 1 笔 OPEN，实际 {len(open_rows)}"
-                remaining_qty = INITIAL_QTY - fill_qty
-                assert abs(float(open_rows[0]["quantity"]) - remaining_qty) < 0.01, (
-                    f"剩余数量应为 {remaining_qty}，实际 {open_rows[0]['quantity']}"
-                )
+        if fill_qty < INITIAL_QTY:
+            assert len(open_rows) == 1, f"部分平仓应保留 1 笔 OPEN，实际 {len(open_rows)}"
+            remaining_qty = INITIAL_QTY - fill_qty
+            assert abs(float(open_rows[0]["quantity"]) - remaining_qty) < 0.01, (
+                f"剩余数量应为 {remaining_qty}，实际 {open_rows[0]['quantity']}"
+            )
 
-            elif abs(fill_qty - INITIAL_QTY) < 0.01:
-                assert len(open_rows) == 0, "全额平仓应无 OPEN 记录"
-                assert len(closed_rows) == 1, "应有 1 笔 CLOSED 记录"
-                assert float(closed_rows[0]["exit_price"]) == fill_price
+        elif abs(fill_qty - INITIAL_QTY) < 0.01:
+            assert len(open_rows) == 0, "全额平仓应无 OPEN 记录"
+            assert len(closed_rows) == 1, "应有 1 笔 CLOSED 记录"
+            assert float(closed_rows[0]["exit_price"]) == fill_price
 
-            else:
-                # ── 卖穿 (fill_qty > 100): 原仓位全平 + 新建反向仓位 ──
-                assert len(closed_rows) >= 1, f"原仓位应被关闭，实际 CLOSED={len(closed_rows)}"
-                assert float(closed_rows[0]["exit_price"]) == fill_price
-                # 新反向仓位
-                reverse_rows = [r for r in open_rows if r["side"] == "SHORT"]
-                assert len(reverse_rows) == 1, (
-                    f"应创建 1 笔 SHORT 反向仓位（超出 {fill_qty - INITIAL_QTY:.1f} 股），"
-                    f"实际 OPEN={len(open_rows)}"
-                )
-                expected_reverse_qty = fill_qty - INITIAL_QTY
-                assert abs(float(reverse_rows[0]["quantity"]) - expected_reverse_qty) < 0.01, (
-                    f"反向仓位数量应为 {expected_reverse_qty}，"
-                    f"实际 {reverse_rows[0]['quantity']}"
-                )
-    finally:
-        _restore_outbound()
+        else:
+            # ── 卖穿 (fill_qty > 100): 原仓位全平 + 新建反向仓位 ──
+            assert len(closed_rows) >= 1, f"原仓位应被关闭，实际 CLOSED={len(closed_rows)}"
+            assert float(closed_rows[0]["exit_price"]) == fill_price
+            # 新反向仓位
+            reverse_rows = [r for r in open_rows if r["side"] == "SHORT"]
+            assert len(reverse_rows) == 1, (
+                f"应创建 1 笔 SHORT 反向仓位（超出 {fill_qty - INITIAL_QTY:.1f} 股），"
+                f"实际 OPEN={len(open_rows)}"
+            )
+            expected_reverse_qty = fill_qty - INITIAL_QTY
+            assert abs(float(reverse_rows[0]["quantity"]) - expected_reverse_qty) < 0.01, (
+                f"反向仓位数量应为 {expected_reverse_qty}，"
+                f"实际 {reverse_rows[0]['quantity']}"
+            )
 
 
-@settings(max_examples=10)
+@settings(max_examples=10, deadline=None)
 @given(
     fill_qty=st.floats(min_value=1.0, max_value=50.0, allow_nan=False, allow_infinity=False),
-    fill_price=st.floats(min_value=80.0, max_value=90.0, allow_nan=False, allow_infinity=False),
+    # 保证 (price-100)*qty < -scratch(~$10)
+    fill_price=st.floats(min_value=80.0, max_value=89.0, allow_nan=False, allow_infinity=False),
 )
 @pytest.mark.asyncio
 async def test_partial_close_loss_triggers_consecutive_loss_counter(fill_qty, fill_price):
-    """亏损部分平仓 → had_loss=True → consecutive_losses 计数器 +1。"""
+    """亏损部分平仓 → TWS realizedPNL 计亏 → consecutive_losses +1。"""
     fill_qty = round(fill_qty, 4)
     fill_price = round(fill_price, 2)
 
-    _patch_outbound()
-    try:
-        async with async_test_db() as get_conn:
-            async with get_conn() as conn:
-                await _seed_open_position(conn)
+    async with async_test_db() as get_conn:
+        async with get_conn() as conn:
+            await _seed_open_position(conn)
 
-            listener = _build_mock_listener()
-            trade = _make_trade()
-            fill = _make_fill(SYMBOL, "SLD", fill_qty, fill_price)
+        listener = _build_mock_listener()
+        trade = _make_trade()
+        fill = _make_fill(SYMBOL, "SLD", fill_qty, fill_price)
 
-            await listener._async_on_execution(trade, fill)
+        await listener._async_on_execution(trade, fill)
 
-            async with get_conn() as conn:
-                cur = await conn.execute(
-                    "SELECT value FROM system_state WHERE key='consecutive_losses'"
-                )
-                row = await cur.fetchone()
-            assert row is not None
-            assert int(row[0]) >= 1, f"亏损卖出后连亏计数应 ≥ 1，实际 {row[0]}"
-    finally:
-        _restore_outbound()
+        async with get_conn() as conn:
+            cur = await conn.execute(
+                "SELECT value FROM system_state WHERE key='consecutive_losses'"
+            )
+            row = await cur.fetchone()
+        assert row is not None
+        assert int(row[0]) >= 1, f"亏损卖出后连亏计数应 ≥ 1，实际 {row[0]}"
