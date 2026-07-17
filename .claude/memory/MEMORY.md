@@ -1,1 +1,0 @@
-- [项目架构文档](project-architecture.md) — RiskManager_System 完整架构：17个模块、数据流、设计决策、定时任务、防抖/熔断/CQRS
